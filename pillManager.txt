@@ -1,0 +1,233 @@
+
+/**
+ * PillManager Catalog
+ *
+ * QUICK NOTE
+ * - All examples assume `const pm = this.context.page.pillManager` and `pm` has `engine` configured.
+ * - Most factory calls return a pill instance and can be chained with `.mount(container)`.
+ *
+ * CORE / GENERIC
+ * 1) create(opts)
+ *    What: Low-level pill constructor for full custom behavior.
+ *    Useful when: You need bespoke source/value formatting/style/action logic.
+ *    Example:
+ *      pm.create({ id:'pill_custom', label:'Custom', source:{kind:'fn', get:()=>42}, type:'info' }).mount('#flags');
+ *
+ * META-DRIVEN
+ * 2) createMetaPill({ key })
+ *    What: Binds pill value to one metaStore key.
+ *    Useful when: Displaying app/session metadata.
+ *    Example:
+ *      pm.createMetaPill({ id:'pill_meta_book', key:'book', label:'Book', type:'info' }).mount('#flags');
+ * 3) createMetaMultiPill({ keys, merge })
+ *    What: Combines multiple meta keys into one pill.
+ *    Useful when: Fallback/merge metadata display.
+ *    Example:
+ *      pm.createMetaMultiPill({ id:'pill_meta_multi', keys:['book','desk'], merge:(vals)=>vals.filter(Boolean).join(' / ') }).mount('#flags');
+ *
+ * FUNCTION / COMPUTED
+ * 4) createFnPill({ get, watchColumns, refreshOnAnyColumn })
+ *    What: Computes value from arbitrary code.
+ *    Useful when: Advanced derived metrics and custom checks.
+ *    Example:
+ *      pm.createFnPill({ id:'pill_fn', get:()=> 'Derived', type:'info', watchColumns:['px'] }).mount('#flags');
+ *
+ * DISTINCT / COUNT / EQUALITY
+ * 5) createPortfolioDistinctPill({ column })
+ *    What: Shows multi-value signal for a column.
+ *    Useful when: Flagging unexpected heterogeneity.
+ *    Example: pm.createPortfolioDistinctPill({ id:'pill_distinct_ccy', column:'ccy' }).mount('#flags');
+ * 6) createPortfolioCountPill({ column, equals, min })
+ *    What: Generic count pill with predicate or equality.
+ *    Useful when: Any thresholded count alert.
+ *    Example: pm.createPortfolioCountPill({ id:'pill_count_bad', column:'qty', equals:(v)=>+v<0, min:1, type:'error' }).mount('#flags');
+ * 7) createPortfolioNullCountPill({ column })
+ *    What: Counts null values.
+ *    Useful when: Completeness checks.
+ *    Example: pm.createPortfolioNullCountPill({ id:'pill_null_isin', column:'isin', min:1 }).mount('#flags');
+ * 8) createPortfolioMissingValuePill({ column })
+ *    What: Counts null/blank values.
+ *    Useful when: Data hygiene checks.
+ *    Example: pm.createPortfolioMissingValuePill({ id:'pill_missing_desig', column:'desigName' }).mount('#flags');
+ * 9) createPortfolioEqualsValuePill({ column, expectedValue })
+ *    What: Counts rows equal to a specific value.
+ *    Useful when: Feature/state prevalence tracking.
+ *    Example: pm.createPortfolioEqualsValuePill({ id:'pill_eq_status', column:'status', expectedValue:'PENDING' }).mount('#flags');
+ * 10) createPortfolioNotEqualsValuePill({ column, expectedValue })
+ *    What: Counts rows not equal to a specific value.
+ *    Useful when: Drift/constraint checks.
+ *    Example: pm.createPortfolioNotEqualsValuePill({ id:'pill_neq_ccy', column:'ccy', expectedValue:'USD' }).mount('#flags');
+ * 11) createPortfolioTrueCountPill({ column })
+ *    What: Counts truthy/flagged rows.
+ *    Useful when: Toggle/boolean signal surfacing.
+ *    Example: pm.createPortfolioTrueCountPill({ id:'pill_true_blocked', column:'isBlocked' }).mount('#flags');
+ *
+ * RANGE / NUMERIC THRESHOLD
+ * 12) createPortfolioRangeCountPill({ column, gt/gte/lt/lte/between })
+ *    What: Counts numeric rows in a range.
+ *    Useful when: Rule thresholds (e.g., limits).
+ *    Example: pm.createPortfolioRangeCountPill({ id:'pill_px_hi', column:'price', gt:100, min:1 }).mount('#flags');
+ * 13) createPortfolioZeroCountPill({ column })
+ *    What: Counts exact numeric zeros.
+ *    Useful when: Missing/placeholder zero audits.
+ *    Example: pm.createPortfolioZeroCountPill({ id:'pill_zero_wgt', column:'weight' }).mount('#flags');
+ * 14) createPortfolioNegativeCountPill({ column })
+ *    What: Counts negative numeric rows.
+ *    Useful when: Invalid-domain detection.
+ *    Example: pm.createPortfolioNegativeCountPill({ id:'pill_neg_qty', column:'qty' }).mount('#flags');
+ * 15) createPortfolioNonNumericCountPill({ column })
+ *    What: Counts non-numeric entries in numeric fields.
+ *    Useful when: Type pollution checks.
+ *    Example: pm.createPortfolioNonNumericCountPill({ id:'pill_nonnum_px', column:'price' }).mount('#flags');
+ * 16) createPortfolioDeltaThresholdPill({ leftColumn, rightColumn, minDeltaAbs })
+ *    What: Counts rows where |left-right| exceeds threshold.
+ *    Useful when: Reconciliation tolerance checks.
+ *    Example: pm.createPortfolioDeltaThresholdPill({ id:'pill_delta', leftColumn:'pxA', rightColumn:'pxB', minDeltaAbs:0.5 }).mount('#flags');
+ * 17) createPortfolioRatioThresholdPill({ numeratorColumn, denominatorColumn, minRatio/maxRatio })
+ *    What: Counts ratio breaches.
+ *    Useful when: Spread/coverage ratio controls.
+ *    Example: pm.createPortfolioRatioThresholdPill({ id:'pill_ratio', numeratorColumn:'used', denominatorColumn:'capacity', maxRatio:0.95 }).mount('#flags');
+ *
+ * MISMATCH / RECONCILIATION
+ * 18) createPortfolioMismatchPill({ leftColumn, rightColumn })
+ *    What: Counts row mismatches between two columns.
+ *    Useful when: Cross-field consistency checks.
+ *    Example: pm.createPortfolioMismatchPill({ id:'pill_mismatch', leftColumn:'bmkA', rightColumn:'bmkB', type:'error' }).mount('#flags');
+ * 19) createPortfolioMismatchRatioPill({ leftColumn, rightColumn, minRatio })
+ *    What: Computes mismatch ratio and alerts when high.
+ *    Useful when: Portfolio-level reconciliation KPI.
+ *    Example: pm.createPortfolioMismatchRatioPill({ id:'pill_mismatch_ratio', leftColumn:'srcA', rightColumn:'srcB', minRatio:0.05 }).mount('#flags');
+ *
+ * DISTRIBUTION / OUTLIER / DISPERSION
+ * 20) createPortfolioOutlierPill({ column, method })
+ *    What: Counts outliers via z-score or IQR.
+ *    Useful when: Anomaly detection.
+ *    Example: pm.createPortfolioOutlierPill({ id:'pill_outlier_px', column:'price', method:'iqr' }).mount('#flags');
+ * 21) createPortfolioDispersionPill({ column, metric, threshold })
+ *    What: Alerts on variance/stddev/range/CV magnitude.
+ *    Useful when: Volatility/wide-dispersion monitoring.
+ *    Example: pm.createPortfolioDispersionPill({ id:'pill_disp', column:'spread', metric:'stddev', threshold:2.0 }).mount('#flags');
+ * 22) createPortfolioVariancePill(opts)
+ *    What: Convenience wrapper for variance checks.
+ *    Useful when: Quick variance alert setup.
+ *    Example: pm.createPortfolioVariancePill({ id:'pill_var', column:'returns', threshold:1.2 }).mount('#flags');
+ * 23) createPortfolioNumericBandPill({ column, low, high, minBandRatio })
+ *    What: Alerts on wide percentile band width.
+ *    Useful when: Detecting broadened distributions.
+ *    Example: pm.createPortfolioNumericBandPill({ id:'pill_band', column:'price', low:0.1, high:0.9, minBandRatio:0.7 }).mount('#flags');
+ * 24) createPortfolioSkewPill({ column, threshold })
+ *    What: Alerts on high skewness.
+ *    Useful when: Asymmetric distribution diagnostics.
+ *    Example: pm.createPortfolioSkewPill({ id:'pill_skew', column:'returns', threshold:1.0 }).mount('#flags');
+ * 25) createPortfolioVolatilitySpikePill({ column })
+ *    What: Compares recent vs baseline stddev.
+ *    Useful when: Regime-change/volatility spike detection.
+ *    Example: pm.createPortfolioVolatilitySpikePill({ id:'pill_vol_spike', column:'returns', minStdRatio:2.0 }).mount('#flags');
+ *
+ * QUALITY / COMPLETENESS / CARDINALITY
+ * 26) createPortfolioDuplicateValuePill({ column })
+ *    What: Counts duplicate occurrences.
+ *    Useful when: Uniqueness constraints.
+ *    Example: pm.createPortfolioDuplicateValuePill({ id:'pill_dup_id', column:'tradeId' }).mount('#flags');
+ * 27) createPortfolioDistinctThresholdPill({ column, minDistinct/maxDistinct })
+ *    What: Alerts when cardinality outside band.
+ *    Useful when: Taxonomy explosion/collapse monitoring.
+ *    Example: pm.createPortfolioDistinctThresholdPill({ id:'pill_distinct_band', column:'desk', minDistinct:2, maxDistinct:12 }).mount('#flags');
+ * 28) createPortfolioCompletenessPill({ column, maxMissingRatio })
+ *    What: Alerts when missing ratio exceeds threshold.
+ *    Useful when: Data completeness SLA checks.
+ *    Example: pm.createPortfolioCompletenessPill({ id:'pill_complete', column:'isin', maxMissingRatio:0.01 }).mount('#flags');
+ * 29) createPortfolioConcentrationPill({ column, topN, minConcentration })
+ *    What: Alerts when top-N categories dominate.
+ *    Useful when: Detecting concentration risk or poor diversity.
+ *    Example: pm.createPortfolioConcentrationPill({ id:'pill_conc', column:'issuer', topN:5, minConcentration:0.8 }).mount('#flags');
+ * 30) createPortfolioDominantValuePill({ column, minShare })
+ *    What: Alerts when one value dominates the dataset.
+ *    Useful when: Detecting data collapse/mapping errors.
+ *    Example: pm.createPortfolioDominantValuePill({ id:'pill_dom', column:'country', minShare:0.9 }).mount('#flags');
+ *
+ * MATHEMATICAL / LOGICAL RULES
+ * 31) createPortfolioGreaterThanPill({ column, threshold })
+ *    What: Counts values greater than threshold.
+ *    Useful when: High-side limit alerts.
+ *    Example: pm.createPortfolioGreaterThanPill({ id:'pill_gt', column:'spread', threshold:100 }).mount('#flags');
+ * 32) createPortfolioLessThanPill({ column, threshold })
+ *    What: Counts values less than threshold.
+ *    Useful when: Floor breaches.
+ *    Example: pm.createPortfolioLessThanPill({ id:'pill_lt', column:'price', threshold:0 }).mount('#flags');
+ * 33) createPortfolioBetweenPill({ column, minValue, maxValue })
+ *    What: Counts values in [min,max].
+ *    Useful when: Window/range eligibility checks.
+ *    Example: pm.createPortfolioBetweenPill({ id:'pill_between', column:'tenor', minValue:1, maxValue:5 }).mount('#flags');
+ * 34) createPortfolioAbsGreaterThanPill({ column, threshold })
+ *    What: Counts abs(value) > threshold.
+ *    Useful when: Magnitude-only alerts around zero.
+ *    Example: pm.createPortfolioAbsGreaterThanPill({ id:'pill_abs', column:'delta', threshold:0.2 }).mount('#flags');
+ * 35) createPortfolioDifferencePill({ leftColumn, rightColumn, comparator, threshold })
+ *    What: Counts row deltas that pass a comparator rule.
+ *    Useful when: General two-column drift checks.
+ *    Example: pm.createPortfolioDifferencePill({ id:'pill_diff', leftColumn:'pxA', rightColumn:'pxB', comparator:'gt', threshold:1.5 }).mount('#flags');
+ * 36) createPortfolioAbsoluteDifferencePill({ leftColumn, rightColumn, threshold })
+ *    What: Counts rows where |left-right| exceeds threshold.
+ *    Useful when: Reconciliation tolerances.
+ *    Example: pm.createPortfolioAbsoluteDifferencePill({ id:'pill_absdiff', leftColumn:'mark', rightColumn:'exec', threshold:0.25 }).mount('#flags');
+ * 37) createPortfolioPercentDifferencePill({ leftColumn, rightColumn, thresholdPct })
+ *    What: Counts rows where percentage difference exceeds threshold.
+ *    Useful when: Relative drift detection.
+ *    Example: pm.createPortfolioPercentDifferencePill({ id:'pill_pctdiff', leftColumn:'navA', rightColumn:'navB', thresholdPct:2 }).mount('#flags');
+ * 38) createPortfolioSumThresholdPill({ leftColumn, rightColumn, comparator, threshold })
+ *    What: Counts rows where (left+right) violates threshold rule.
+ *    Useful when: Combined exposure/limit controls.
+ *    Example: pm.createPortfolioSumThresholdPill({ id:'pill_sum', leftColumn:'leg1', rightColumn:'leg2', comparator:'gt', threshold:1000 }).mount('#flags');
+ * 39) createPortfolioProductThresholdPill({ leftColumn, rightColumn, comparator, threshold })
+ *    What: Counts rows where product violates threshold rule.
+ *    Useful when: Notional-like derived guards.
+ *    Example: pm.createPortfolioProductThresholdPill({ id:'pill_prod', leftColumn:'qty', rightColumn:'px', comparator:'gt', threshold:1e6 }).mount('#flags');
+ * 40) createPortfolioAnyRulePill({ column, rules })
+ *    What: Counts rows where any configured rule matches.
+ *    Useful when: Composite OR rule packs.
+ *    Example: pm.createPortfolioAnyRulePill({ id:'pill_any', column:'score', rules:[{comparator:'lt',threshold:10},{comparator:'gt',threshold:95}] }).mount('#flags');
+ * 41) createPortfolioAllRulePill({ column, rules })
+ *    What: Counts rows where all rules match simultaneously.
+ *    Useful when: Composite AND constraints.
+ *    Example: pm.createPortfolioAllRulePill({ id:'pill_all', column:'ratio', rules:[{comparator:'gte',threshold:0},{comparator:'lte',threshold:1}] }).mount('#flags');
+ * 42) createPortfolioLogicalPairPill({ leftColumn, rightColumn, predicate })
+ *    What: Counts rows violating/passing custom boolean pair logic.
+ *    Useful when: Domain-specific logical invariants.
+ *    Example: pm.createPortfolioLogicalPairPill({ id:'pill_logic', leftColumn:'isActive', rightColumn:'deactTs', predicate:(a,b)=> (a===true && b==null) }).mount('#flags');
+ * TEMPORAL / TIME-DATE-DATETIME
+ * 43) createPortfolioStaleTimePill({ column, threshold, unit })
+ *    What: Flags stale timestamps older than a threshold from now.
+ *    Useful when: Freshness and timeliness SLA checks.
+ *    Example: pm.createPortfolioStaleTimePill({ id:'pill_stale', column:'lastUpdateTs', threshold:3, unit:'days' }).mount('#flags');
+ * 44) createPortfolioComparativelyStalePill({ leftColumn, rightColumn, threshold, unit })
+ *    What: Flags rows where two temporal columns differ by too much.
+ *    Useful when: Ingestion vs publish lag control.
+ *    Example: pm.createPortfolioComparativelyStalePill({ id:'pill_lag', leftColumn:'sourceTs', rightColumn:'publishTs', threshold:15, unit:'minutes' }).mount('#flags');
+ * 45) createPortfolioFutureTimePill({ column, minLead, unit })
+ *    What: Flags timestamps too far in the future.
+ *    Useful when: Clock skew and bad date-entry detection.
+ *    Example: pm.createPortfolioFutureTimePill({ id:'pill_future', column:'eventTs', minLead:10, unit:'minutes' }).mount('#flags');
+ * 46) createPortfolioSoonDuePill({ column, within, unit })
+ *    What: Highlights rows with upcoming timestamps inside a forward window.
+ *    Useful when: Deadlines / maturities due soon.
+ *    Example: pm.createPortfolioSoonDuePill({ id:'pill_due', column:'maturityTs', within:48, unit:'hours' }).mount('#flags');
+ * 47) createPortfolioOffHoursPill({ column, startHour, endHour })
+ *    What: Flags events occurring outside expected business hours.
+ *    Useful when: Unexpected after-hours activity monitoring.
+ *    Example: pm.createPortfolioOffHoursPill({ id:'pill_offhours', column:'tradeTs', startHour:7, endHour:19 }).mount('#flags');
+ * 48) createPortfolioTemporalGapOutlierPill({ column, threshold, unit })
+ *    What: Flags unusually large consecutive temporal gaps.
+ *    Useful when: Detecting schedule holes / feed outages.
+ *    Example: pm.createPortfolioTemporalGapOutlierPill({ id:'pill_gap', column:'obsTs', threshold:2, unit:'hours' }).mount('#flags');
+ * 49) createPortfolioStaleDatePill({ column, maxAgeDays })
+ *    What: Backward-compatible wrapper over stale-time checks (days).
+ *    Useful when: Existing integrations already call stale-date API.
+ *    Example: pm.createPortfolioStaleDatePill({ id:'pill_stale_date', column:'lastUpdateTs', maxAgeDays:3 }).mount('#flags');
+ *
+ * REFERENCE / TELEMETRY
+ * 50) createRefMarketMetricsPill({ markets, mode })
+ *    What: Coverage/usage telemetry for reference market mapping.
+ *    Useful when: Observability of ref-market completeness.
+ *    Example: pm.createRefMarketMetricsPill({ id:'pill_ref_cov', markets:['US','EU'], mode:'both' }).mount('#flags');
+ */
