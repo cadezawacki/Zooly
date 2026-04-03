@@ -842,23 +842,25 @@ export class PivotWidget extends BaseWidget {
         // ── Diff compare toggle ────────────────────────────────────────────
         const _diffToggleId = `rdm-diff-toggle-${Math.random().toString(36).slice(2,8)}`;
         const _diffSummaryId = `rdm-diff-summary-${Math.random().toString(36).slice(2,8)}`;
-        constantsHtml += `<div style="display:flex;align-items:center;gap:8px;padding:2px 0;">`;
-        constantsHtml += `<label style="display:flex;align-items:center;gap:4px;font-size:11px;opacity:${_diffAvailable ? '1' : '0.35'};cursor:${_diffAvailable ? 'pointer' : 'not-allowed'};">`;
-        constantsHtml += `<input type="checkbox" id="${_diffToggleId}" ${_diffAvailable ? '' : 'disabled'} style="margin:0;"/>`;
-        constantsHtml += `<span>Compare vs previous run</span></label>`;
-        constantsHtml += `<span id="${_diffSummaryId}" style="font-size:11px;display:none;"></span>`;
+        constantsHtml += `<div style="display:flex;align-items:center;gap:10px;padding:3px 0;">`;
+        constantsHtml += `<label class="scfg-link-toggle" style="opacity:${_diffAvailable ? '1' : '0.35'};cursor:${_diffAvailable ? 'pointer' : 'not-allowed'};font-size:11px;gap:5px;">`;
+        constantsHtml += `<input type="checkbox" id="${_diffToggleId}" ${_diffAvailable ? '' : 'disabled'}/>`;
+        constantsHtml += `<span>Compare vs previous</span>`;
+        constantsHtml += `<svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 3h5v5"/><path d="M8 3H3v5"/><path d="M21 3l-7 7"/><path d="M3 3l7 7"/><path d="M16 21h5v-5"/><path d="M8 21H3v-5"/><path d="M21 21l-7-7"/><path d="M3 21l7-7"/></svg>`;
+        constantsHtml += `</label>`;
+        constantsHtml += `<span id="${_diffSummaryId}" style="font-size:10px;opacity:0.6;display:none;"></span>`;
         constantsHtml += `</div>`;
 
         // Diff annotation helper: returns a tiny HTML string showing the change
         let _diffEnabled = false;
         const _diffAnnotation = (cur, prev, fmt) => {
-            if (!_diffEnabled || prev == null || cur == null) return '';
+            if (prev == null || cur == null) return '';
             const d = (+cur) - (+prev);
             if (!Number.isFinite(d) || Math.abs(d) < 0.005) return '';
             const arrow = d > 0 ? '↑' : '↓';
             const display = fmt ? fmt(Math.abs(d)) : Math.abs(d).toFixed(2);
             const color = 'rgba(148,163,184,0.7)';
-            return `<div class="rdm-diff-ann" style="font-size:9px;color:${color};line-height:1;" title="change from previous run">${arrow}${display}</div>`;
+            return `<div class="rdm-diff-ann" style="font-size:9px;color:${color};line-height:1;display:none;" title="change from previous run">${arrow}${display}</div>`;
         };
         // Keys that get diff annotations
         const _diffKeys = new Set(['wavg_start_skew','wavg_bucket_effect','wavg_trader_effect','wavg_skew_delta','proceeds_delta',
@@ -923,7 +925,7 @@ export class PivotWidget extends BaseWidget {
             {key: 'proceeds_delta', label: 'PNL Δ', tip: 'Delta', fmt: v => fmtK(v, true, "$"), isPnl: true},
             {key: 'binding_constraint', label: 'Bound', tip: 'Constraint', fmt: v => {
                 if (!v) return '';
-                const labels = {side: 'SIDE', trader: 'TRADER', mid: 'MID', cap: 'CAP', locked: 'LOCK'};
+                const labels = {side: 'WAVG', trader: 'ALLOC', mid: 'MID', cap: 'CAP', locked: 'LOCK'};
                 const colors = {side: '#f59e0b', trader: '#8b5cf6', mid: '#3b82f6', cap: '#ef4444', locked: '#6b7280'};
                 const label = labels[v] || v;
                 const color = colors[v] || '#9ca3af';
@@ -1160,6 +1162,13 @@ export class PivotWidget extends BaseWidget {
                     <span title="Everything the optimizer did beyond what the curve wanted: PnL chasing, constraints, trader rebalancing"><b>Residual</b> optimizer adjustment beyond curve</span>
                     <span title="Parallel shift to preserve starting weighted-avg skew (Anchor WAVG Skew)"><b>Adj</b> wavg skew anchor correction</span>
                     <span title="Curve + Residual + Adj = total change"><b>Delta</b> = Curve + Residual + Adj</span>
+            </div>
+            <div class="rdm-table-legend" style="margin-top:2px;">
+                    <span title="Bond hit the WAVG skew band — total proceeds per side can only shift ±(1−floor%)"><span style="background:#f59e0b22;color:#f59e0b;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">WAVG</span> side-level skew band</span>
+                    <span title="Bond hit the trader allocation guardrail — trader's total proceeds can't deviate beyond buffer from target"><span style="background:#8b5cf622;color:#8b5cf6;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">ALLOC</span> trader allocation band</span>
+                    <span title="Bond can't cross mid (charge sign constrained)"><span style="background:#3b82f622;color:#3b82f6;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">MID</span> through-mid limit</span>
+                    <span title="Bond hit the per-bond skew delta cap"><span style="background:#ef444422;color:#ef4444;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">CAP</span> per-bond skew cap</span>
+                    <span title="Bond is locked and cannot be moved"><span style="background:#6b728022;color:#6b7280;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">LOCK</span> locked</span>
             </div>
         </div>
     `;
@@ -1985,6 +1994,7 @@ export class PivotWidget extends BaseWidget {
                 if (crossingEl) crossingEl.addEventListener('change', _persistOnChange);
                 if (matchPivotEl) matchPivotEl.addEventListener('change', _persistOnChange);
                 if (isolateEl) isolateEl.addEventListener('change', _persistOnChange);
+                if (anchorWavgEl) anchorWavgEl.addEventListener('change', _persistOnChange);
                 for (const [elId] of fieldPairs) {
                     const input = document.getElementById(elId);
                     if (input) {
