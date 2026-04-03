@@ -828,6 +828,9 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
     for attempt, tier in enumerate(tiers):
         log.notify(f'Running solver tier {attempt}: {tier["desc"]}')
         constraints: list[cp.Constraint] = []
+        # Constraint metadata for attribution: list of (constraint, type, scope)
+        # scope is either a side string, a tbk tuple, or a bond index j
+        _constraint_meta: list[tuple] = []
 
         # ── Side band constraints ─────────────────────────────────────
         for s in u_sides:
@@ -849,7 +852,9 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
                 ceil_val = cfg.side_floor_pct * start_val
 
             constraints.append(side_total >= floor_val)
+            _constraint_meta.append((constraints[-1], 'side_floor', s))
             constraints.append(side_total <= ceil_val)
+            _constraint_meta.append((constraints[-1], 'side_ceil', s))
 
         # ── Gamma penalty: soft pull toward trader targets ────────────
         gamma_terms = []
@@ -887,7 +892,9 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
                     buf = max(buf, abs(target - start_tbk) * 1.5)
                 buf *= tier["buffer_mult"]
                 constraints.append(trader_total <= target + buf)
+                _constraint_meta.append((constraints[-1], 'trader_ceil', tbk))
                 constraints.append(trader_total >= target - buf)
+                _constraint_meta.append((constraints[-1], 'trader_floor', tbk))
 
         gamma_penalty = 0.0
         if gamma_terms and cfg.trader_pull > 0:
@@ -898,8 +905,10 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
             for j, i in enumerate(ul_idx):
                 if bond_bk[i] in (("SELL", "PX"), ("BUY", "SPD")):
                     constraints.append(charge[j] >= 0)
+                    _constraint_meta.append((constraints[-1], 'mid', j))
                 else:
                     constraints.append(charge[j] <= 0)
+                    _constraint_meta.append((constraints[-1], 'mid', j))
 
         # ── Per-bond skew delta caps (optional) ──────────────────────
         for j, i in enumerate(ul_idx):
@@ -907,11 +916,15 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
             if q == "SPD" and cfg.max_individual_spread_skew_delta is not None:
                 cap = cfg.max_individual_spread_skew_delta
                 constraints.append(charge[j] - start_ul[j] <= cap)
+                _constraint_meta.append((constraints[-1], 'cap_upper', j))
                 constraints.append(charge[j] - start_ul[j] >= -cap)
+                _constraint_meta.append((constraints[-1], 'cap_lower', j))
             elif q == "PX" and cfg.max_individual_px_skew_delta is not None:
                 cap_bps = cfg.max_individual_px_skew_delta * 100.0
                 constraints.append(charge[j] - start_ul[j] <= cap_bps)
+                _constraint_meta.append((constraints[-1], 'cap_upper', j))
                 constraints.append(charge[j] - start_ul[j] >= -cap_bps)
+                _constraint_meta.append((constraints[-1], 'cap_lower', j))
 
         # ── Construct objective ───────────────────────────────────────
         total_proceeds_expr = cp.sum(ul_proceeds) + locked_proceeds_total
@@ -944,11 +957,48 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
             log.error("Optimization failed — returning starting values as fallback.")
         else:
             log.error(f"Optimization for {name} failed — returning starting values.")
+        # ── Infeasibility diagnosis ──────────────────────────────────────
+        try:
+            _diag_reasons = []
+            _n_locked = int(np.sum(locked))
+            _pct_locked = _n_locked / N * 100 if N else 0
+            if _pct_locked > 80:
+                _diag_reasons.append(f"{_pct_locked:.0f}% of bonds are locked — very little room for the solver to move.")
+            for s in u_sides:
+                s_mask = np.array([sides[i] == s for i in range(N)])
+                s_locked = np.array([locked[i] and sides[i] == s for i in range(N)])
+                locked_proceeds_s = float(np.sum(proceeds[s_locked]))
+                total_proceeds_s = start_by_side.get(s, 0)
+                if total_proceeds_s != 0:
+                    locked_pct = abs(locked_proceeds_s / total_proceeds_s) * 100
+                    floor = cfg.side_floor_pct * abs(total_proceeds_s)
+                    unlocked_proceeds_s = abs(total_proceeds_s) - abs(locked_proceeds_s)
+                    if unlocked_proceeds_s < abs(total_proceeds_s) * (1 - cfg.side_floor_pct):
+                        _diag_reasons.append(
+                            f"{s}: Locked bonds hold {locked_pct:.0f}% of proceeds, leaving too little "
+                            f"room within the {cfg.side_floor_pct:.0%} side floor constraint."
+                        )
+            for tbk in tbk_keys:
+                tbk_ul = [i for i in range(N) if bond_tbk[i] == tbk and not locked[i]]
+                tbk_lk = [i for i in range(N) if bond_tbk[i] == tbk and locked[i]]
+                if len(tbk_ul) == 0 and len(tbk_lk) > 0:
+                    t, s, q = tbk
+                    _diag_reasons.append(f"Trader {t} ({s} {q}): all {len(tbk_lk)} bonds are locked.")
+            if not _diag_reasons:
+                _diag_reasons.append("No specific cause identified — try relaxing constraints or unlocking bonds.")
+            diagnostics = {
+                "status": "FAILED",
+                "bonds_total": N, "bonds_unlocked": int(N - _n_locked),
+                "infeasibility_reasons": _diag_reasons,
+            }
+        except Exception:
+            diagnostics = {"status": "FAILED", "bonds_total": N}
 
     # Extract optimal charges
     final_charge_bps = np.copy(starting_charge_bps)
     final_proceeds_arr = np.copy(proceeds)
     anchor_adj_arr = np.zeros(N)
+    _bond_constraint = [''] * N
     diagnostics = {}
     if is_ok_final and charge.value is not None:
         optimal = charge.value
@@ -966,6 +1016,49 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
             # Re-read optimal for diagnostics after anchoring
             for j, i in enumerate(ul_idx):
                 optimal[j] = final_charge_bps[i]
+
+        # ── Constraint attribution: identify binding constraints per bond ──
+        # For each unlocked bond, check which constraint (if any) is binding.
+        # A constraint is considered binding when its slack (residual) is near zero.
+        _SLACK_TOL = 1e-4
+        try:
+            # Side-level and trader-level constraints: binding = affects all unlocked bonds in scope
+            _binding_sides = set()
+            _binding_tbks = set()
+            for constr, ctype, scope in _constraint_meta:
+                dv = constr.dual_value
+                if dv is None:
+                    continue
+                is_binding = (np.abs(dv) > _SLACK_TOL) if np.isscalar(dv) else (np.any(np.abs(dv) > _SLACK_TOL))
+                if not is_binding:
+                    continue
+                if ctype in ('side_floor', 'side_ceil'):
+                    _binding_sides.add(scope)
+                elif ctype in ('trader_floor', 'trader_ceil'):
+                    _binding_tbks.add(scope)
+                elif ctype in ('mid', 'cap_upper', 'cap_lower'):
+                    j = scope  # unlocked index
+                    i = ul_idx[j]  # global index
+                    label = 'mid' if ctype == 'mid' else 'cap'
+                    if not _bond_constraint[i]:
+                        _bond_constraint[i] = label
+
+            # Attribute group-level binding constraints to individual bonds
+            for j, i in enumerate(ul_idx):
+                if _bond_constraint[i]:
+                    continue  # per-bond constraint takes priority
+                bk = bond_bk[i]
+                tbk = bond_tbk[i]
+                if tbk in _binding_tbks:
+                    _bond_constraint[i] = 'trader'
+                elif bk[0] in _binding_sides:
+                    _bond_constraint[i] = 'side'
+        except Exception:
+            pass  # attribution is best-effort, don't break the solve
+
+        # Mark locked bonds
+        for i in lk_idx:
+            _bond_constraint[i] = 'locked'
 
         # ── Build diagnostics dict ───────────────────────────────────────
         _deltas = optimal - start_ul
@@ -1136,6 +1229,7 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
         pl.Series("implied_px", np.round(implied_px, 6)),
         pl.Series("implied_spd", np.round(np.nan_to_num(implied_spd, nan=0), 4)),
         pl.Series("spd_delta", np.round(np.where(~is_px, implied_spd - quote_spd, 0), 4)),
+        pl.Series("binding_constraint", _bond_constraint),
         pl.col(_c('locked')).alias('isLocked'),
     ]
     if orig_group_cols is not None:
@@ -1387,6 +1481,7 @@ def _build_fallback_result(sub_df: pl.LazyFrame, cfg: OptimizerConfig) -> pl.Dat
         pl.Series("implied_px", np.round(implied_px, 6)),
         pl.Series("implied_spd", np.round(np.nan_to_num(implied_spd, nan=0), 4)),
         pl.Series("spd_delta", np.zeros(N)),
+        pl.Series("binding_constraint", [''] * N),
         pl.col(_c('locked')).alias('isLocked'),
     ] + [pl.col(gc) for gc in (getattr(cfg, 'group_columns', None) or []) if gc in collected.columns])
 
@@ -1407,7 +1502,14 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
 
     inner_col, orig_group_cols = _resolve_inner_col(cfg)
 
-    traders_unique = df.select(pl.col(_c('trader')).unique()).collect().to_series().to_list()
+    if orig_group_cols is not None:
+        df = _add_group_key_column(df, orig_group_cols)
+        iter_col = _GROUP_KEY_COL
+    else:
+        iter_col = _c('trader')
+    keys_unique = df.select(pl.col(iter_col).unique()).collect().to_series().to_list()
+
+    sub_cfg.group_columns = None  # sub-solve has only 1 group, grouping is meaningless
 
     dfs_out: list[pl.LazyFrame] = []
     per_group_diagnostics: dict[str, dict] = {}
@@ -1415,8 +1517,8 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
     combined_start_by_side, combined_final_by_side = {}, {}
     total_obj = 0.0
 
-    for t in traders_unique:
-        sub_df = df.filter(pl.col(_c('trader')) == t)
+    for t in keys_unique:
+        sub_df = df.filter(pl.col(iter_col) == t)
         try:
             df_r, res_r, _, _, _ = solve(sub_df, sub_cfg, name=t)
             if not isinstance(res_r, OptimizationResult):
@@ -1458,6 +1560,12 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
         raise RuntimeError("All isolated trader solves failed.")
 
     df_result = pl.concat(dfs_out)
+
+    # Re-attach original group columns (sub-solves had group_columns=None so didn't include them)
+    if orig_group_cols is not None:
+        _gc_select = [pl.col(_c('bond_id'))] + [pl.col(gc) for gc in orig_group_cols]
+        _gc_frame = df.select(_gc_select).distinct()
+        df_result = df_result.join(_gc_frame, on=_c('bond_id'), how='left')
 
     # Recompute bond-level risk_pct from the FULL cross-trader dataset.
     # Each sub-solve had only 1 trader → its risk_pct was always 1.0.

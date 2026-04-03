@@ -686,6 +686,52 @@ export class PivotWidget extends BaseWidget {
         }
 
         const {detail, removed, summary, trader, updates, result, group_columns: resGroupCols} = res;
+
+        // ── Diff view: compare vs previous run ────────────────────────────
+        const _DIFF_KEY = 'pt:redistPrev';
+        const _portfolioKey = roomContext?.room || 'default';
+        const _groupSig = JSON.stringify(resGroupCols || ['desigName']);
+        let _prevRun = null;
+        let _diffAvailable = false;
+        try {
+            const raw = sessionStorage.getItem(_DIFF_KEY);
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                if (parsed.portfolioKey === _portfolioKey && parsed.groupSig === _groupSig) {
+                    _prevRun = parsed;
+                    _diffAvailable = true;
+                }
+            }
+        } catch {}
+        // Build lookup indexes from previous run
+        const _prevDetailIdx = new Map();
+        const _prevTraderIdx = new Map();
+        if (_prevRun) {
+            for (const b of (_prevRun.detail || [])) _prevDetailIdx.set(b.tnum, b);
+            for (const t of (_prevRun.trader || [])) {
+                const k = `${t.desigName || ''}|${t.side}|${t.quoteType}`;
+                _prevTraderIdx.set(k, t);
+            }
+        }
+        // Save current run for next comparison
+        try {
+            sessionStorage.setItem(_DIFF_KEY, JSON.stringify({
+                portfolioKey: _portfolioKey,
+                groupSig: _groupSig,
+                detail: (detail || []).map(b => ({
+                    tnum: b.tnum, skew: b.skew, bucket_effect: b.bucket_effect,
+                    group_effect: b.group_effect, skew_delta: b.skew_delta,
+                    proceeds_delta: b.proceeds_delta,
+                })),
+                trader: (trader || []).map(t => ({
+                    desigName: t.desigName, side: t.side, quoteType: t.quoteType,
+                    wavg_start_skew: t.wavg_start_skew, wavg_bucket_effect: t.wavg_bucket_effect,
+                    wavg_trader_effect: t.wavg_trader_effect, wavg_skew_delta: t.wavg_skew_delta,
+                    proceeds_delta: t.proceeds_delta,
+                })),
+            }));
+        } catch {}
+
         // Determine the grouping key column(s) — defaults to desigName when not using pivot groups
         const _groupCols = (resGroupCols && resGroupCols.length > 0) ? resGroupCols : ['desigName'];
         const _groupLabel = _groupCols.length === 1
@@ -781,6 +827,42 @@ export class PivotWidget extends BaseWidget {
         // Diagnostics from backend (if available)
         const diag = res.diagnostics || {};
 
+        // Infeasibility diagnosis
+        const _infReasons = diag.infeasibility_reasons || [];
+        if (_infReasons.length > 0) {
+            constantsHtml += `<div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:6px;padding:8px 12px;margin:6px 0;">`;
+            constantsHtml += `<div style="color:#ef4444;font-weight:600;font-size:12px;margin-bottom:4px;">Solver could not find a feasible solution</div>`;
+            for (const reason of _infReasons) {
+                constantsHtml += `<div style="color:#fca5a5;font-size:11px;padding:1px 0;">• ${esc(reason)}</div>`;
+            }
+            constantsHtml += `</div>`;
+        }
+
+
+        // ── Diff compare toggle ────────────────────────────────────────────
+        const _diffToggleId = `rdm-diff-toggle-${Math.random().toString(36).slice(2,8)}`;
+        const _diffSummaryId = `rdm-diff-summary-${Math.random().toString(36).slice(2,8)}`;
+        constantsHtml += `<div style="display:flex;align-items:center;gap:8px;padding:2px 0;">`;
+        constantsHtml += `<label style="display:flex;align-items:center;gap:4px;font-size:11px;opacity:${_diffAvailable ? '1' : '0.35'};cursor:${_diffAvailable ? 'pointer' : 'not-allowed'};">`;
+        constantsHtml += `<input type="checkbox" id="${_diffToggleId}" ${_diffAvailable ? '' : 'disabled'} style="margin:0;"/>`;
+        constantsHtml += `<span>Compare vs previous run</span></label>`;
+        constantsHtml += `<span id="${_diffSummaryId}" style="font-size:11px;display:none;"></span>`;
+        constantsHtml += `</div>`;
+
+        // Diff annotation helper: returns a tiny HTML string showing the change
+        let _diffEnabled = false;
+        const _diffAnnotation = (cur, prev, fmt) => {
+            if (!_diffEnabled || prev == null || cur == null) return '';
+            const d = (+cur) - (+prev);
+            if (!Number.isFinite(d) || Math.abs(d) < 0.005) return '';
+            const arrow = d > 0 ? '↑' : '↓';
+            const display = fmt ? fmt(Math.abs(d)) : Math.abs(d).toFixed(2);
+            const color = 'rgba(148,163,184,0.7)';
+            return `<div class="rdm-diff-ann" style="font-size:9px;color:${color};line-height:1;" title="change from previous run">${arrow}${display}</div>`;
+        };
+        // Keys that get diff annotations
+        const _diffKeys = new Set(['wavg_start_skew','wavg_bucket_effect','wavg_trader_effect','wavg_skew_delta','proceeds_delta',
+                                   'skew','bucket_effect','group_effect','skew_delta']);
 
         const CHEVRON_SVG = `<svg class="rdm-chevron" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6 3L11 8L6 13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
@@ -839,11 +921,19 @@ export class PivotWidget extends BaseWidget {
             {key: 'final_skew', label: 'Final', tip: 'Skew', fmt: v => fmtNum(v, 2, true), highlight: true},
             {key: 'skew_delta', label: 'Delta Δ', tip: 'Skew', fmt: v => fmtNum(v, 2, true), isDelta: true},
             {key: 'proceeds_delta', label: 'PNL Δ', tip: 'Delta', fmt: v => fmtK(v, true, "$"), isPnl: true},
-            // {key: 'proceeds_delta',   label: 'Δ Proceeds',    tip: '',       fmt: v => fmtK(v), isDelta: true},
+            {key: 'binding_constraint', label: 'Bound', tip: 'Constraint', fmt: v => {
+                if (!v) return '';
+                const labels = {side: 'SIDE', trader: 'TRADER', mid: 'MID', cap: 'CAP', locked: 'LOCK'};
+                const colors = {side: '#f59e0b', trader: '#8b5cf6', mid: '#3b82f6', cap: '#ef4444', locked: '#6b7280'};
+                const label = labels[v] || v;
+                const color = colors[v] || '#9ca3af';
+                return `<span style="background:${color}22;color:${color};padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">${label}</span>`;
+            }},
         ];
 
         const buildBondRows = (bondList, qt, side) => {
             return bondList.map(bond => {
+                const prev = _prevDetailIdx.get(bond.tnum);
                 return '<tr>' + bondDetailCols.map(c => {
                     const raw = bond[c.key];
                     const display = c.fmt ? c.fmt(raw) : esc(raw);
@@ -857,13 +947,14 @@ export class PivotWidget extends BaseWidget {
                         }
                     }
                     if (c.isPnl && raw != null && Number.isFinite(+raw)) {
-                        style += deltaColor(raw, 'PX', 'SELL'); // hacky way to say >0 better
+                        style += deltaColor(raw, 'PX', 'SELL');
                         if (Math.abs(+raw) > 2000) style += 'font-weight:600;';
                     }
                     if (c.highlight) style += 'font-weight:600;color:var(--rdm-accent);';
                     let cl = (c?.className ? c.className : '');
                     if (typeof cl === 'function') cl = cl(raw);
-                    return `<td style="${style}" class="${cl}">${display}</td>`;
+                    const diff = (_diffKeys.has(c.key) && prev) ? _diffAnnotation(raw, prev[c.key], c.fmt) : '';
+                    return `<td style="${style}" class="${cl}">${display}${diff}</td>`;
                 }).join('') + '</tr>';
             }).join('');
         };
@@ -901,6 +992,7 @@ export class PivotWidget extends BaseWidget {
                 const bonds = detailIndex.get(detailKey) || [];
 
                 // Summary row
+                const _prevTrader = _prevTraderIdx.get(`${row.desigName || ''}|${side}|${qt}`);
                 const cells = summaryDisplayCols.map(c => {
                     if (c.key === '_expand') {
                         return `<td style="width:24px;text-align:center;padding:4px 2px;">${CHEVRON_SVG}</td>`;
@@ -916,11 +1008,12 @@ export class PivotWidget extends BaseWidget {
                         }
                     }
                     if (c.isPnl && raw != null && Number.isFinite(+raw)) {
-                        style += deltaColor(raw, 'PX', 'SELL'); // hacky way to say >0 better
+                        style += deltaColor(raw, 'PX', 'SELL');
                         if (Math.abs(+raw) > 2000) style += 'font-weight:600;';
                     }
                     if (c.highlight) style += 'font-weight:600;';
-                    return `<td style="${style}" class="td-${qt.toString().toLowerCase()} td-${side.toString().toLowerCase()}">${display}</td>`;
+                    const diff = (_diffKeys.has(c.key) && _prevTrader) ? _diffAnnotation(raw, _prevTrader[c.key], c.fmt) : '';
+                    return `<td style="${style}" class="td-${qt.toString().toLowerCase()} td-${side.toString().toLowerCase()}">${display}${diff}</td>`;
                 }).join('');
 
                 const stripeClass = localIdx % 2 === 0 ? 'rdm-stripe-even' : 'rdm-stripe-odd';
@@ -1115,6 +1208,38 @@ export class PivotWidget extends BaseWidget {
                 arrow.remove();
             }
         };
+
+        // -- Diff toggle listener -----------------------------------------------
+        requestAnimationFrame(() => {
+            const diffToggle = document.getElementById(_diffToggleId);
+            if (diffToggle) {
+                diffToggle.addEventListener('change', () => {
+                    _diffEnabled = diffToggle.checked;
+                    // Toggle visibility of all diff annotations
+                    const anns = document.querySelectorAll('.rdm-diff-ann');
+                    for (const el of anns) el.style.display = _diffEnabled ? '' : 'none';
+                    // Show/hide summary
+                    const sumEl = document.getElementById(_diffSummaryId);
+                    if (sumEl) {
+                        if (_diffEnabled && _prevRun) {
+                            // Build a quick summary comparing wavg_skew_delta per bucket
+                            const parts = [];
+                            for (const cur of (summary || [])) {
+                                const prev = (_prevRun.trader || []).find(p =>
+                                    p.side === cur.side && p.quoteType === cur.quoteType && !p.desigName);
+                                // Can't match overall summary easily, skip
+                            }
+                            sumEl.textContent = 'Showing changes from previous run';
+                            sumEl.style.display = '';
+                        } else {
+                            sumEl.style.display = 'none';
+                        }
+                    }
+                });
+            }
+            // Hide all diff annotations initially (toggle is off)
+            for (const el of document.querySelectorAll('.rdm-diff-ann')) el.style.display = 'none';
+        });
 
         // -- Attach row-expansion logic after DOM render ---------------------
         requestAnimationFrame(() => {
@@ -1633,10 +1758,14 @@ export class PivotWidget extends BaseWidget {
                     matchPivotEl.addEventListener('change', () => {
                         opts.match_pivot_groups = matchPivotEl.checked;
                         if (matchPivotEl.checked) {
-                            // Collect current pivot group columns, excluding the always-present quoteType and side groups
-                            const excludeGroups = new Set(['quoteType', 'QT', 'side', 'userSide']);
+                            // Collect current pivot group columns, excluding always-present and
+                            // invalid groups (desigName is already the default trader grouping;
+                            // derived/computed columns don't exist on the backend DataFrame)
+                            const excludeGroups = new Set(['quoteType', 'QT', 'side', 'userSide', 'desigName']);
+                            const allCols = new Set(Object.keys(this.adapter?.engine?._colDefs || {}));
                             const pivotGroups = (this.ptPivot?.pivotConfig?.groupBy || [])
-                                .filter(g => !excludeGroups.has(g));
+                                .filter(g => !excludeGroups.has(g))
+                                .filter(g => allCols.size === 0 || allCols.has(g));
                             opts.group_columns = pivotGroups.length > 0 ? pivotGroups : null;
                         } else {
                             opts.group_columns = null;
