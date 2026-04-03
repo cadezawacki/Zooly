@@ -1176,6 +1176,7 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
         pl.Series("implied_px", np.round(implied_px, 6)),
         pl.Series("implied_spd", np.round(np.nan_to_num(implied_spd, nan=0), 4)),
         pl.Series("spd_delta", np.round(np.where(~is_px, implied_spd - quote_spd, 0), 4)),
+        pl.col(_c('locked')).alias('isLocked'),
     ]
     if orig_group_cols is not None:
         for gc in orig_group_cols:
@@ -1414,6 +1415,7 @@ def _build_fallback_result(sub_df: pl.LazyFrame, cfg: OptimizerConfig) -> pl.Dat
         pl.Series("implied_px", np.round(implied_px, 6)),
         pl.Series("implied_spd", np.round(np.nan_to_num(implied_spd, nan=0), 4)),
         pl.Series("spd_delta", np.zeros(N)),
+        pl.col(_c('locked')).alias('isLocked'),
     ] + [pl.col(gc) for gc in (getattr(cfg, 'group_columns', None) or []) if gc in collected.columns])
 
 
@@ -1532,25 +1534,23 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
             _anch_df = df_result.collect() if hasattr(df_result, 'collect') else df_result
             _anch_sides = _anch_df[_c('side')].to_list()
             _anch_qts = _anch_df[_c('quote_type')].to_list()
+            _anch_N = len(_anch_df)
             _anch_final_charge = _anch_df['final_charge_bps'].to_numpy().astype(float).copy()
+            _anch_is_px = np.array([q == "PX" for q in _anch_qts])
+            _anch_bps_to_skew = np.where(_anch_is_px, 1.0 / 100.0, 1.0)
             _anch_start_charge = np.where(
-                np.array([q == "PX" for q in _anch_qts]),
+                _anch_is_px,
                 _anch_df['skew'].to_numpy().astype(float) * 100.0,
                 _anch_df['skew'].to_numpy().astype(float),
             )
             _anch_kappa = _anch_df['kappa'].to_numpy().astype(float)
-            _anch_is_px = np.array([q == "PX" for q in _anch_qts])
-            _anch_bps_to_skew = np.where(_anch_is_px, 1.0 / 100.0, 1.0)
-            _anch_locked = np.array([
-                abs(float(sd)) < 1e-8
-                for sd in _anch_df['skew_delta'].to_numpy()
-            ])  # In isolated mode, "locked" bonds have zero skew_delta
+            _anch_locked = _anch_df['isLocked'].cast(pl.Boolean, strict=False).to_numpy()
             _anch_signs = np.array([
                 (1 if _anch_qts[i] == "SPD" and _anch_sides[i] == "BUY"
                  else -1 if _anch_qts[i] == "SPD" and _anch_sides[i] == "SELL"
                  else -1 if _anch_qts[i] == "PX" and _anch_sides[i] == "BUY"
                  else 1)
-                for i in range(len(_anch_sides))
+                for i in range(_anch_N)
             ])
             _anch_final_proceeds = _anch_df['final_proceeds'].to_numpy().astype(float).copy()
 
@@ -1561,17 +1561,52 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
                 debug=cfg.debug,
             )
 
+            # Recompute all derived columns from the corrected charge/proceeds
             _anch_implied_skew = _anch_final_charge * _anch_bps_to_skew
-            _anch_start_skew = _anch_start_charge * _anch_bps_to_skew
             _anch_skew_delta = (_anch_final_charge - _anch_start_charge) * _anch_bps_to_skew
             _anch_proceeds_delta = _anch_final_proceeds - _anch_df['starting_proceeds'].to_numpy().astype(float)
+
+            _anch_ref_mid_spd = _anch_df[_c('ref_mid_spd')].to_numpy().astype(float)
+            _anch_ref_mid_px = _anch_df[_c('ref_mid_px')].to_numpy().astype(float)
+            _anch_sizes = _anch_df[_c('size')].to_numpy().astype(float)
+            _anch_side_signs = np.array([1.0 if s == "BUY" else -1.0 for s in _anch_sides])
+            _anch_implied_px = _anch_ref_mid_px - _anch_side_signs * (
+                _anch_final_proceeds * 100.0 / np.where(_anch_sizes > 0, _anch_sizes, 1.0)
+            )
+            _anch_implied_spd = np.where(~_anch_is_px, _anch_ref_mid_spd + _anch_final_charge, np.nan)
+            _anch_quote_spd = _anch_df[_c('quote_spd')].to_numpy().astype(float)
+
+            # Recompute decomposition (bucket_effect, group_effect)
+            _anch_bucket_effect = np.zeros(_anch_N)
+            _anch_inner_col = _anch_df[_c('trader')].to_list()
+            _anch_tbk_keys = set()
+            _anch_bond_tbk = []
+            for i in range(_anch_N):
+                tbk = (_anch_inner_col[i] or 'MISSING', _anch_sides[i], _anch_qts[i])
+                _anch_tbk_keys.add(tbk)
+                _anch_bond_tbk.append(tbk)
+            for tbk in _anch_tbk_keys:
+                tbk_mask = np.array([_anch_bond_tbk[i] == tbk for i in range(_anch_N)])
+                tbk_delta = _anch_skew_delta[tbk_mask]
+                _anch_bucket_effect[tbk_mask] = np.mean(tbk_delta) if tbk_mask.any() else 0.0
+            _anch_group_effect = _anch_skew_delta - _anch_bucket_effect
+            # Zero out locked bonds
+            for i in range(_anch_N):
+                if _anch_locked[i]:
+                    _anch_bucket_effect[i] = 0.0
+                    _anch_group_effect[i] = 0.0
 
             df_result = _anch_df.with_columns([
                 pl.Series("final_charge_bps", np.round(_anch_final_charge, 4)),
                 pl.Series("final_skew", np.round(_anch_implied_skew, 4)),
                 pl.Series("skew_delta", np.round(_anch_skew_delta, 4)),
+                pl.Series("bucket_effect", np.round(_anch_bucket_effect, 4)),
+                pl.Series("group_effect", np.round(_anch_group_effect, 4)),
                 pl.Series("final_proceeds", np.round(_anch_final_proceeds, 0)),
                 pl.Series("proceeds_delta", np.round(_anch_proceeds_delta, 0)),
+                pl.Series("implied_px", np.round(_anch_implied_px, 6)),
+                pl.Series("implied_spd", np.round(np.nan_to_num(_anch_implied_spd, nan=0), 4)),
+                pl.Series("spd_delta", np.round(np.where(~_anch_is_px, _anch_implied_spd - _anch_quote_spd, 0), 4)),
             ]).lazy()
         except Exception as e:
             if cfg.debug: log.warning(f"Isolated anchor WAVG skew failed: {e}")
