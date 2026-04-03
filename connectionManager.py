@@ -2616,6 +2616,16 @@ class ConnectionManager:
             group_columns = options.get('group_columns', None)
             if group_columns is not None and not isinstance(group_columns, list):
                 group_columns = None
+            if group_columns is not None:
+                schema_cols = set(grid_frame.hyper.schema().keys())
+                # Remove desigName (already the default inner grouping column)
+                # and filter to only columns that actually exist on the DataFrame
+                rejected = [c for c in group_columns if c not in schema_cols or c == 'desigName']
+                group_columns = [c for c in group_columns if c in schema_cols and c != 'desigName']
+                if rejected:
+                    await log.warning(f"[redistribute] Dropped invalid group columns: {rejected}")
+                if not group_columns:
+                    group_columns = None
 
             # Sanitize: ensure float or None
             def _opt_float(v):
