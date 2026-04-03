@@ -1,36 +1,24 @@
 """
-Bond Charge Optimization (Delta Space)
-=======================================
+Bond Charge Optimization (Direct Charge Space)
+===============================================
 Decision variables:
-    X[side, qt]                    - n_bk scalars (bucket-level FLAT uniform shift)
-    Y_add[trader, side, qt]        - n_tbk scalars ≥ 0 (trader additions, BLENDED weight)
-    Y_reduce[trader, side, qt]     - n_tbk scalars ≥ 0 (trader reductions, INVERSE-BLENDED weight)
+    charge[j]  - final charge in bps for each unlocked bond j
 
 Per unlocked bond i:
-    delta_charge_i  =  X[s,q]                          (flat: all bonds shift equally)
-                     + Y_add[t,s,q] * blended_i        (BSR/illiquid get MORE additions)
-                     - Y_reduce[t,s,q] * inv_weight_i  (BSI/liquid absorb MORE reductions)
-
-    final_charge_i  =  starting_charge_i + delta_charge_i
-
-    With X=0, Y_add=0, Y_reduce=0: every bond keeps its starting charge.
-
-Three structurally different weights (proven non-degenerate for any trader
-group with 3+ bonds having distinct blended values):
-    X:        weight = 1.0           (flat)
-    Y_add:    weight = blended_i     (priority-proportional, range ~0.3–2.5)
-    Y_reduce: weight = blended_i^-α  (inverse-priority, range ~0.4–3.0)
+    proceeds_i  =  sign_i × charge_i × kappa_i
 
 Key config parameters:
-    penalty_strength (lambda_param):   Global smoothing — how much change is allowed
-    wide_skew_penalty (skew_stiffness): Extra penalty for bonds with large starting charges
-    priority_exponent (liq_alpha):     How strongly Y_reduce targets BSI over BSR
-    target_blend:                      0=keep starting allocation, 1=full risk-weighted
+    lambda_param:   Anchoring — penalizes charge deviations from starting
+    gamma:          Curve shaping — penalizes deviations from charge-curve ideal
+    trader_pull:    Soft penalty for trader proceeds deviating from target
+    target_blend:   0=keep starting allocation, 1=full risk-weighted
 
-Objective:  MAXIMIZE Σ delta_proceeds_i
+Objective:  MAXIMIZE Σ proceeds_i - λ·anchoring - γ·curve_pull - tp·trader_pull
 Constraints:
     1. Side band       (total proceeds within [floor×start, start/floor])
     2. Trader band     (trader proceeds within target ± buffer)
+    3. Through-mid     (optional: prevent sign flip)
+    4. Per-bond caps   (optional: max individual skew delta)
 """
 
 from __future__ import annotations
@@ -189,28 +177,11 @@ class OptimizerConfig:
     Min: 0.0 | Max: unbounded (practical: 0.1–10.0) | Default: 1.0"""
 
     # ── Objective & penalty ─────────────────────────────────────────────
-    linear: bool = False
-    """If True, use a linear objective (no penalty term). Faster but allows
-    the optimizer to make large per-bond changes with no smoothing cost.
-    Default: False"""
-
     lambda_param: float = 0.25
     """Penalty strength for per-bond charge deviations from starting.
     Higher values keep individual bond charges closer to starting; lower
     values allow more redistribution. Clamped to >= 0.
     Min: 0.0 | Max: unbounded (practical: 0.01–1.0) | Default: 0.25"""
-
-    liq_alpha: float = 1.0
-    """Controls how strongly the inverse-priority Y weight protects BSR
-    bonds during reductions. Y_reduce weight = blended^(-liq_alpha).
-    0.0 = uniform (all bonds absorb equally). 1.0 = BSI absorbs ~50% more.
-    2.0 = BSI absorbs ~2.25x more.
-    Min: 0.0 | Max: unbounded (practical: 0.0–3.0) | Default: 1.0"""
-
-    skew_stiffness: float = 0.05
-    """Extra penalty weight for bonds with large starting charges. Prevents
-    the optimizer from collapsing wide skews. Multiplier = 1 + stiffness × |starting_charge|.
-    Min: 0.0 | Max: unbounded (practical: 0.0–0.5) | Default: 0.05"""
 
     skew_asymmetry: float = 0.0
     """Additional penalty that discourages reducing a bond's absolute charge
@@ -230,16 +201,6 @@ class OptimizerConfig:
     Min: 0.0 | Max: 1.0 | Default: None (→ 0.20)"""
 
     # ── Skew delta caps ─────────────────────────────────────────────────
-    max_spread_skew_delta: float | None = None
-    """Maximum allowed weighted-average skew change per bucket for SPD bonds.
-    None = disabled. Units: spread bps × total kappa.
-    Min: 0.0 | Max: unbounded | Default: None (disabled)"""
-
-    max_px_skew_delta: float | None = None
-    """Maximum allowed weighted-average skew change per bucket for PX bonds.
-    None = disabled. Units: price points × total kappa.
-    Min: 0.0 | Max: unbounded | Default: None (disabled)"""
-
     max_individual_spread_skew_delta: float | None = None
     """Maximum per-bond skew change for SPD bonds. None = disabled.
     Units: spread bps.
@@ -300,17 +261,6 @@ class OptimizerConfig:
     solver_verbose: bool = False
     """Pass verbose=True to the solver for iteration-level output.
     Default: False"""
-
-    normalize_objective_by_bucket: bool = True
-    """If True, normalizes each bucket's contribution to the objective by
-    its starting proceeds magnitude, preventing large buckets from
-    dominating. Uses an adaptive floor (10th percentile).
-    Default: True"""
-
-    objective_norm_floor: float = 1.0
-    """Minimum denominator for bucket normalization. Prevents division by
-    near-zero starting proceeds.
-    Min: 0.01 | Max: unbounded | Default: 1.0"""
 
     def __post_init__(self):
         if not self.risk_weights:

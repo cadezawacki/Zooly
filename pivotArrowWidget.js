@@ -669,7 +669,6 @@ export class PivotWidget extends BaseWidget {
                 const cached = _readScfgCache();
                 // -- Solver-options state (lives across the modal lifecycle) ------
                 const opts = {
-                    linear: false,
                     isolate_traders: cached.isolate_traders ?? false,
                     max_individual_spread_skew_delta: cached.max_individual_spread_skew_delta ?? null,
                     max_individual_px_skew_delta: cached.max_individual_px_skew_delta ?? null,
@@ -1293,7 +1292,6 @@ export class PivotWidget extends BaseWidget {
             const cached = _readScfgCache();
             // -- Solver-options state (lives across the modal lifecycle) ------
             const opts = {
-                linear: false,
                 isolate_traders: cached.isolate_traders ?? false,
                 anchor_wavg_skew: cached.anchor_wavg_skew ?? false,
                 max_individual_spread_skew_delta: cached.max_individual_spread_skew_delta ?? null,
@@ -1354,7 +1352,6 @@ export class PivotWidget extends BaseWidget {
                 const cached = _readScfgCache();
                 // -- Solver-options state (lives across the modal lifecycle) ------
                 const opts = {
-                    linear: false,
                     isolate_traders: cached.isolate_traders ?? false,
                     max_individual_spread_skew_delta: cached.max_individual_spread_skew_delta ?? null,
                     max_individual_px_skew_delta: cached.max_individual_px_skew_delta ?? null,
@@ -1447,7 +1444,6 @@ export class PivotWidget extends BaseWidget {
 
             // -- Solver-options state (lives across the modal lifecycle) ------
             const opts = {
-                linear: false,
                 isolate_traders: cached.isolate_traders ?? false,
                 max_individual_spread_skew_delta: cached.max_individual_spread_skew_delta ?? null,
                 max_individual_px_skew_delta: cached.max_individual_px_skew_delta ?? null,
