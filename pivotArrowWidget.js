@@ -706,11 +706,15 @@ export class PivotWidget extends BaseWidget {
         // Build lookup indexes from previous run
         const _prevDetailIdx = new Map();
         const _prevTraderIdx = new Map();
+        const _prevSummaryIdx = new Map();
         if (_prevRun) {
             for (const b of (_prevRun.detail || [])) _prevDetailIdx.set(b.tnum, b);
             for (const t of (_prevRun.trader || [])) {
-                const k = `${t.desigName || ''}|${t.side}|${t.quoteType}`;
+                const k = `${t._groupKey || t.desigName || ''}|${t.side}|${t.quoteType}`;
                 _prevTraderIdx.set(k, t);
+            }
+            for (const s of (_prevRun.summary || [])) {
+                _prevSummaryIdx.set(`${s.side}|${s.quoteType}`, s);
             }
         }
         // Save current run for next comparison
@@ -724,10 +728,16 @@ export class PivotWidget extends BaseWidget {
                     proceeds_delta: b.proceeds_delta,
                 })),
                 trader: (trader || []).map(t => ({
+                    _groupKey: _buildGroupKey(t),
                     desigName: t.desigName, side: t.side, quoteType: t.quoteType,
                     wavg_start_skew: t.wavg_start_skew, wavg_bucket_effect: t.wavg_bucket_effect,
                     wavg_trader_effect: t.wavg_trader_effect, wavg_skew_delta: t.wavg_skew_delta,
                     proceeds_delta: t.proceeds_delta,
+                })),
+                summary: (summary || []).map(s => ({
+                    side: s.side, quoteType: s.quoteType,
+                    wavg_skew_delta: s.wavg_skew_delta, proceeds_delta: s.proceeds_delta,
+                    wavg_start_skew: s.wavg_start_skew, wavg_final_skew: s.wavg_final_skew,
                 })),
             }));
         } catch {}
@@ -994,7 +1004,7 @@ export class PivotWidget extends BaseWidget {
                 const bonds = detailIndex.get(detailKey) || [];
 
                 // Summary row
-                const _prevTrader = _prevTraderIdx.get(`${row.desigName || ''}|${side}|${qt}`);
+                const _prevTrader = _prevTraderIdx.get(`${_buildGroupKey(row)}|${side}|${qt}`);
                 const cells = summaryDisplayCols.map(c => {
                     if (c.key === '_expand') {
                         return `<td style="width:24px;text-align:center;padding:4px 2px;">${CHEVRON_SVG}</td>`;
@@ -1227,18 +1237,30 @@ export class PivotWidget extends BaseWidget {
                     // Toggle visibility of all diff annotations
                     const anns = document.querySelectorAll('.rdm-diff-ann');
                     for (const el of anns) el.style.display = _diffEnabled ? '' : 'none';
-                    // Show/hide summary
+                    // Show/hide summary bar
                     const sumEl = document.getElementById(_diffSummaryId);
                     if (sumEl) {
                         if (_diffEnabled && _prevRun) {
-                            // Build a quick summary comparing wavg_skew_delta per bucket
                             const parts = [];
+                            let totalPnlDelta = 0;
                             for (const cur of (summary || [])) {
-                                const prev = (_prevRun.trader || []).find(p =>
-                                    p.side === cur.side && p.quoteType === cur.quoteType && !p.desigName);
-                                // Can't match overall summary easily, skip
+                                const prev = _prevSummaryIdx.get(`${cur.side}|${cur.quoteType}`);
+                                if (!prev) continue;
+                                const dSkew = (cur.wavg_skew_delta ?? 0) - (prev.wavg_skew_delta ?? 0);
+                                const dPnl = (cur.proceeds_delta ?? 0) - (prev.proceeds_delta ?? 0);
+                                totalPnlDelta += dPnl;
+                                if (Math.abs(dSkew) > 0.005) {
+                                    const arrow = dSkew > 0 ? '↑' : '↓';
+                                    parts.push(`${cur.side} ${cur.quoteType} wavg ${arrow}${Math.abs(dSkew).toFixed(2)}bps`);
+                                }
                             }
-                            sumEl.textContent = 'Showing changes from previous run';
+                            if (Math.abs(totalPnlDelta) > 1) {
+                                const sign = totalPnlDelta > 0 ? '+' : '';
+                                parts.push(`PnL ${sign}$${Math.round(totalPnlDelta).toLocaleString()}`);
+                            }
+                            sumEl.innerHTML = parts.length > 0
+                                ? parts.map(p => `<span style="margin:0 4px;">${p}</span>`).join('·')
+                                : '<span style="opacity:0.5;">No meaningful changes</span>';
                             sumEl.style.display = '';
                         } else {
                             sumEl.style.display = 'none';
