@@ -2687,8 +2687,6 @@ class ConnectionManager:
                 # Solver
                 debug=debug_mode,
                 group_columns=group_columns,
-                normalize_objective_by_bucket=bool(options.get('normalize_objective_by_bucket', solver_defaults.get('normalize_objective_by_bucket', True))),
-                objective_norm_floor=options.get('objective_norm_floor', solver_defaults.get('objective_norm_floor', 1)),
 
                 # "Run From X" starting skew override
                 starting_skew_override=_parse_skew_override(options.get('starting_skew_override')),

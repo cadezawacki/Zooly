@@ -669,7 +669,6 @@ export class PivotWidget extends BaseWidget {
                 const cached = _readScfgCache();
                 // -- Solver-options state (lives across the modal lifecycle) ------
                 const opts = {
-                    linear: false,
                     isolate_traders: cached.isolate_traders ?? false,
                     max_individual_spread_skew_delta: cached.max_individual_spread_skew_delta ?? null,
                     max_individual_px_skew_delta: cached.max_individual_px_skew_delta ?? null,
@@ -798,7 +797,7 @@ export class PivotWidget extends BaseWidget {
             {key: 'wavg_start_skew', label: 'Start', tip: 'Skew', fmt: v => fmtNum(v, 2, true)},
             {key: 'wavg_bucket_effect', label: 'Curve', tip: 'Effect', fmt: v => fmtNum(v, 2, true), isDelta: true},
             {key: 'wavg_trader_effect', label: 'Residual', tip: 'Effect', fmt: v => fmtNum(v, 2, true), isDelta: true},
-            // {key: 'wavg_slack_effect', label: 'Slack', tip: 'Effect', fmt: v => fmtNum(v, 2, true), isDelta: true},
+            {key: 'wavg_anchor_adj', label: 'Adj', tip: 'Anchor', fmt: v => fmtNum(v, 2, true), isDelta: true, isAdj: true},
             {key: 'wavg_final_skew', label: 'Final', tip: 'Skew', fmt: v => fmtNum(v, 2, true), highlight: true},
             {key: 'wavg_skew_delta', label: 'Wavg Δ', tip: 'Delta', fmt: v => fmtNum(v, 2, true), isDelta: true},
             {key: 'proceeds_delta', label: 'PNL Δ', tip: 'Delta', fmt: v => fmtK(v, true, "$"), isPnl: true},
@@ -836,7 +835,7 @@ export class PivotWidget extends BaseWidget {
             {key: 'skew', label: 'Start', tip: 'Skew', fmt: v => fmtNum(v, 2, true)},
             {key: 'bucket_effect', label: 'Curve', tip: 'Effect', fmt: v => fmtNum(v, 2, false), isDelta: true},
             {key: 'group_effect', label: 'Residual', tip: 'Effect', fmt: v => fmtNum(v, 2, false), isDelta: true},
-            // {key: 'slack_effect', label: 'Slack', tip: 'Effect', fmt: v => fmtNum(v, 2, true), isDelta: true},
+            {key: 'anchor_adj', label: 'Adj', tip: 'Anchor', fmt: v => fmtNum(v, 2, false), isDelta: true, isAdj: true},
             {key: 'final_skew', label: 'Final', tip: 'Skew', fmt: v => fmtNum(v, 2, true), highlight: true},
             {key: 'skew_delta', label: 'Delta Δ', tip: 'Skew', fmt: v => fmtNum(v, 2, true), isDelta: true},
             {key: 'proceeds_delta', label: 'PNL Δ', tip: 'Delta', fmt: v => fmtK(v, true, "$"), isPnl: true},
@@ -850,8 +849,12 @@ export class PivotWidget extends BaseWidget {
                     const display = c.fmt ? c.fmt(raw) : esc(raw);
                     let style = '';
                     if (c.isDelta && raw != null && Number.isFinite(+raw)) {
-                        style += deltaColor(raw, qt, side);
-                        if (Math.abs(+raw) > 0.05) style += 'font-weight:600;';
+                        if (c.isAdj && Math.abs(+raw) > 0.1) {
+                            style += 'color:#f87171;font-weight:600;';
+                        } else {
+                            style += deltaColor(raw, qt, side);
+                            if (Math.abs(+raw) > 0.05) style += 'font-weight:600;';
+                        }
                     }
                     if (c.isPnl && raw != null && Number.isFinite(+raw)) {
                         style += deltaColor(raw, 'PX', 'SELL'); // hacky way to say >0 better
@@ -906,7 +909,11 @@ export class PivotWidget extends BaseWidget {
                     const display = c.fmt ? c.fmt(raw) : esc(raw);
                     let style = '';
                     if (c.isDelta && raw != null && Number.isFinite(+raw)) {
-                        style += deltaColor(raw, qt, side);
+                        if (c.isAdj && Math.abs(+raw) > 0.1) {
+                            style += 'color:#f87171;font-weight:600;';
+                        } else {
+                            style += deltaColor(raw, qt, side);
+                        }
                     }
                     if (c.isPnl && raw != null && Number.isFinite(+raw)) {
                         style += deltaColor(raw, 'PX', 'SELL'); // hacky way to say >0 better
@@ -1058,7 +1065,8 @@ export class PivotWidget extends BaseWidget {
             <div class="rdm-table-legend">
                 <span title="What the charge curve says this bond should move based on BSR/BSI/liquidity"><b>Curve</b> target shift from charge curve</span>
                     <span title="Everything the optimizer did beyond what the curve wanted: PnL chasing, constraints, trader rebalancing"><b>Residual</b> optimizer adjustment beyond curve</span>
-                    <span title="Curve + Residual = total change"><b>Delta</b> = Curve + Residual</span>
+                    <span title="Parallel shift to preserve starting weighted-avg skew (Anchor WAVG Skew)"><b>Adj</b> wavg skew anchor correction</span>
+                    <span title="Curve + Residual + Adj = total change"><b>Delta</b> = Curve + Residual + Adj</span>
             </div>
         </div>
     `;
@@ -1293,7 +1301,6 @@ export class PivotWidget extends BaseWidget {
             const cached = _readScfgCache();
             // -- Solver-options state (lives across the modal lifecycle) ------
             const opts = {
-                linear: false,
                 isolate_traders: cached.isolate_traders ?? false,
                 anchor_wavg_skew: cached.anchor_wavg_skew ?? false,
                 max_individual_spread_skew_delta: cached.max_individual_spread_skew_delta ?? null,
@@ -1354,7 +1361,6 @@ export class PivotWidget extends BaseWidget {
                 const cached = _readScfgCache();
                 // -- Solver-options state (lives across the modal lifecycle) ------
                 const opts = {
-                    linear: false,
                     isolate_traders: cached.isolate_traders ?? false,
                     max_individual_spread_skew_delta: cached.max_individual_spread_skew_delta ?? null,
                     max_individual_px_skew_delta: cached.max_individual_px_skew_delta ?? null,
@@ -1447,7 +1453,6 @@ export class PivotWidget extends BaseWidget {
 
             // -- Solver-options state (lives across the modal lifecycle) ------
             const opts = {
-                linear: false,
                 isolate_traders: cached.isolate_traders ?? false,
                 max_individual_spread_skew_delta: cached.max_individual_spread_skew_delta ?? null,
                 max_individual_px_skew_delta: cached.max_individual_px_skew_delta ?? null,

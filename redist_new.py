@@ -1,36 +1,24 @@
 """
-Bond Charge Optimization (Delta Space)
-=======================================
+Bond Charge Optimization (Direct Charge Space)
+===============================================
 Decision variables:
-    X[side, qt]                    - n_bk scalars (bucket-level FLAT uniform shift)
-    Y_add[trader, side, qt]        - n_tbk scalars ≥ 0 (trader additions, BLENDED weight)
-    Y_reduce[trader, side, qt]     - n_tbk scalars ≥ 0 (trader reductions, INVERSE-BLENDED weight)
+    charge[j]  - final charge in bps for each unlocked bond j
 
 Per unlocked bond i:
-    delta_charge_i  =  X[s,q]                          (flat: all bonds shift equally)
-                     + Y_add[t,s,q] * blended_i        (BSR/illiquid get MORE additions)
-                     - Y_reduce[t,s,q] * inv_weight_i  (BSI/liquid absorb MORE reductions)
-
-    final_charge_i  =  starting_charge_i + delta_charge_i
-
-    With X=0, Y_add=0, Y_reduce=0: every bond keeps its starting charge.
-
-Three structurally different weights (proven non-degenerate for any trader
-group with 3+ bonds having distinct blended values):
-    X:        weight = 1.0           (flat)
-    Y_add:    weight = blended_i     (priority-proportional, range ~0.3–2.5)
-    Y_reduce: weight = blended_i^-α  (inverse-priority, range ~0.4–3.0)
+    proceeds_i  =  sign_i × charge_i × kappa_i
 
 Key config parameters:
-    penalty_strength (lambda_param):   Global smoothing — how much change is allowed
-    wide_skew_penalty (skew_stiffness): Extra penalty for bonds with large starting charges
-    priority_exponent (liq_alpha):     How strongly Y_reduce targets BSI over BSR
-    target_blend:                      0=keep starting allocation, 1=full risk-weighted
+    lambda_param:   Anchoring — penalizes charge deviations from starting
+    gamma:          Curve shaping — penalizes deviations from charge-curve ideal
+    trader_pull:    Soft penalty for trader proceeds deviating from target
+    target_blend:   0=keep starting allocation, 1=full risk-weighted
 
-Objective:  MAXIMIZE Σ delta_proceeds_i
+Objective:  MAXIMIZE Σ proceeds_i - λ·anchoring - γ·curve_pull - tp·trader_pull
 Constraints:
     1. Side band       (total proceeds within [floor×start, start/floor])
     2. Trader band     (trader proceeds within target ± buffer)
+    3. Through-mid     (optional: prevent sign flip)
+    4. Per-bond caps   (optional: max individual skew delta)
 """
 
 from __future__ import annotations
@@ -189,28 +177,11 @@ class OptimizerConfig:
     Min: 0.0 | Max: unbounded (practical: 0.1–10.0) | Default: 1.0"""
 
     # ── Objective & penalty ─────────────────────────────────────────────
-    linear: bool = False
-    """If True, use a linear objective (no penalty term). Faster but allows
-    the optimizer to make large per-bond changes with no smoothing cost.
-    Default: False"""
-
     lambda_param: float = 0.25
     """Penalty strength for per-bond charge deviations from starting.
     Higher values keep individual bond charges closer to starting; lower
     values allow more redistribution. Clamped to >= 0.
     Min: 0.0 | Max: unbounded (practical: 0.01–1.0) | Default: 0.25"""
-
-    liq_alpha: float = 1.0
-    """Controls how strongly the inverse-priority Y weight protects BSR
-    bonds during reductions. Y_reduce weight = blended^(-liq_alpha).
-    0.0 = uniform (all bonds absorb equally). 1.0 = BSI absorbs ~50% more.
-    2.0 = BSI absorbs ~2.25x more.
-    Min: 0.0 | Max: unbounded (practical: 0.0–3.0) | Default: 1.0"""
-
-    skew_stiffness: float = 0.05
-    """Extra penalty weight for bonds with large starting charges. Prevents
-    the optimizer from collapsing wide skews. Multiplier = 1 + stiffness × |starting_charge|.
-    Min: 0.0 | Max: unbounded (practical: 0.0–0.5) | Default: 0.05"""
 
     skew_asymmetry: float = 0.0
     """Additional penalty that discourages reducing a bond's absolute charge
@@ -230,16 +201,6 @@ class OptimizerConfig:
     Min: 0.0 | Max: 1.0 | Default: None (→ 0.20)"""
 
     # ── Skew delta caps ─────────────────────────────────────────────────
-    max_spread_skew_delta: float | None = None
-    """Maximum allowed weighted-average skew change per bucket for SPD bonds.
-    None = disabled. Units: spread bps × total kappa.
-    Min: 0.0 | Max: unbounded | Default: None (disabled)"""
-
-    max_px_skew_delta: float | None = None
-    """Maximum allowed weighted-average skew change per bucket for PX bonds.
-    None = disabled. Units: price points × total kappa.
-    Min: 0.0 | Max: unbounded | Default: None (disabled)"""
-
     max_individual_spread_skew_delta: float | None = None
     """Maximum per-bond skew change for SPD bonds. None = disabled.
     Units: spread bps.
@@ -300,17 +261,6 @@ class OptimizerConfig:
     solver_verbose: bool = False
     """Pass verbose=True to the solver for iteration-level output.
     Default: False"""
-
-    normalize_objective_by_bucket: bool = True
-    """If True, normalizes each bucket's contribution to the objective by
-    its starting proceeds magnitude, preventing large buckets from
-    dominating. Uses an adaptive floor (10th percentile).
-    Default: True"""
-
-    objective_norm_floor: float = 1.0
-    """Minimum denominator for bucket normalization. Prevents division by
-    near-zero starting proceeds.
-    Min: 0.01 | Max: unbounded | Default: 1.0"""
 
     def __post_init__(self):
         if not self.risk_weights:
@@ -411,7 +361,7 @@ def _apply_anchor_wavg_skew(
     is_px: np.ndarray,
     bps_to_skew: np.ndarray,
     debug: bool = False,
-):
+) -> np.ndarray:
     """Post-solver correction: parallel-shift unlocked bonds so that the
     weighted-average skew per (side, quoteType) bucket matches the original
     starting wavg skew.
@@ -419,9 +369,11 @@ def _apply_anchor_wavg_skew(
     Weight = dv01 (=kappa) for SPD, size/10000 (=kappa) for PX — kappa
     already encodes the correct weighting convention.
 
-    Returns modified (final_charge_bps, final_proceeds_arr) in-place.
+    Modifies final_charge_bps and final_proceeds_arr in-place.
+    Returns anchor_adj: per-bond adjustment in skew units (0 for locked bonds).
     """
     N = len(final_charge_bps)
+    anchor_adj = np.zeros(N)
     bucket_keys = set()
     for i in range(N):
         bucket_keys.add((sides[i], qts[i]))
@@ -462,11 +414,14 @@ def _apply_anchor_wavg_skew(
         for idx in ul_indices:
             final_charge_bps[idx] += shift_bps
             final_proceeds_arr[idx] = signs[idx] * final_charge_bps[idx] * kappa[idx]
+            anchor_adj[idx] = shift_skew
 
         if debug:
             new_skew = final_charge_bps[bk_mask] * bps_to_skew[bk_mask]
             new_wavg = float(np.sum(new_skew * bk_kappa) / total_weight)
             print(f"[AnchorWAVG] {s_side} {s_qt}: start={start_wavg:.4f} → solver={post_wavg:.4f} → anchored={new_wavg:.4f}  (shift={shift_skew:.4f})")
+
+    return anchor_adj
 
 
 def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
@@ -993,6 +948,7 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
     # Extract optimal charges
     final_charge_bps = np.copy(starting_charge_bps)
     final_proceeds_arr = np.copy(proceeds)
+    anchor_adj_arr = np.zeros(N)
     diagnostics = {}
     if is_ok_final and charge.value is not None:
         optimal = charge.value
@@ -1002,7 +958,7 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
 
         # ── Anchor WAVG skew correction (post-solver parallel shift) ─────
         if cfg.anchor_wavg_skew:
-            _apply_anchor_wavg_skew(
+            anchor_adj_arr = _apply_anchor_wavg_skew(
                 final_charge_bps, final_proceeds_arr, starting_charge_bps,
                 signs, kappa, sides, qts, locked, is_px, bps_to_skew,
                 debug=cfg.debug,
@@ -1059,13 +1015,16 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
         diagnostics = {"status": "FAILED", "bonds_total": N, "bonds_unlocked": n_ul}
 
     # ── Decomposition (post-hoc) ──────────────────────────────────────
-    #   delta[i] = final_charge - starting_charge (in skew units)
-    #   bucket_effect[i] = kappa-weighted avg delta across all bonds in bucket
-    #   group_effect[i] = delta[i] - bucket_effect[i]
-    #   Invariant: bucket_effect + group_effect = skew_delta (exact)
+    #   skew_delta[i] = final_charge - starting_charge (in skew units, includes anchor)
+    #   solver_delta[i] = skew_delta - anchor_adj (what the solver alone did)
+    #   bucket_effect[i] = avg solver_delta across bonds in trader-bucket
+    #   group_effect[i] = solver_delta[i] - bucket_effect[i]
+    #   Invariant: bucket_effect + group_effect + anchor_adj = skew_delta (exact)
 
     charge_delta = final_charge_bps - starting_charge_bps
     skew_delta = charge_delta * bps_to_skew
+    # anchor_adj_arr is set above (zeros if anchor disabled)
+    solver_delta = skew_delta - anchor_adj_arr
 
     # Informational: ideal charge (from curve) vs starting
     ideal_full = np.copy(starting_charge_bps)
@@ -1085,13 +1044,13 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
 
     # Per trader-bucket average: bucket_effect shows the average shift for this
     # trader in this (side, qt) basket. group_effect shows how much each individual
-    # bond deviated from that trader's average.
+    # bond deviated from that trader's average (excluding anchor adjustment).
     for tbk in set(bond_tbk):
         tbk_mask = np.array([bond_tbk[i] == tbk for i in range(N)])
-        tbk_delta = skew_delta[tbk_mask]
+        tbk_delta = solver_delta[tbk_mask]
         bucket_effect[tbk_mask] = np.mean(tbk_delta) if tbk_mask.any() else 0.0
 
-    group_effect = skew_delta - bucket_effect
+    group_effect = solver_delta - bucket_effect
 
     # Zero out locked bonds
     for i in lk_idx:
@@ -1170,6 +1129,7 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
         pl.Series("rebase_effect", np.round(rebase_effect, 4)),
         pl.Series("bucket_effect", np.round(bucket_effect, 4)),
         pl.Series("group_effect", np.round(group_effect, 4)),
+        pl.Series("anchor_adj", np.round(anchor_adj_arr, 4)),
         pl.Series("risk_pct", np.round(bond_risk_pct, 6)),
         pl.Series("final_proceeds", np.round(final_proceeds_arr, 0)),
         pl.Series("proceeds_delta", np.round(final_proceeds_arr - proceeds, 0)),
@@ -1197,6 +1157,7 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
             pl.col('rebase_effect').hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_rebase_effect_dv01'),
             pl.col('bucket_effect').hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_bucket_effect_dv01'),
             pl.col('group_effect').hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_trader_effect_dv01'),
+            pl.col('anchor_adj').hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_anchor_adj_dv01'),
 
             pl.col('skew').hyper.wavg(pl.col(_c('size'))).alias('_wavg_start_skew_size'),
             pl.col('final_skew').hyper.wavg(pl.col(_c('size'))).alias('_wavg_final_skew_size'),
@@ -1205,6 +1166,7 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
             pl.col('rebase_effect').hyper.wavg(pl.col(_c('size'))).alias('_wavg_rebase_effect_size'),
             pl.col('bucket_effect').hyper.wavg(pl.col(_c('size'))).alias('_wavg_bucket_effect_size'),
             pl.col('group_effect').hyper.wavg(pl.col(_c('size'))).alias('_wavg_trader_effect_size'),
+            pl.col('anchor_adj').hyper.wavg(pl.col(_c('size'))).alias('_wavg_anchor_adj_size'),
         ]
     ).with_columns(
         [
@@ -1229,6 +1191,9 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
             pl.when(pl.col(_c('quote_type'))=="SPD").then(pl.col('_wavg_trader_effect_dv01')).otherwise(
                 pl.col('_wavg_trader_effect_size')
             ).alias('wavg_trader_effect'),
+            pl.when(pl.col(_c('quote_type'))=="SPD").then(pl.col('_wavg_anchor_adj_dv01')).otherwise(
+                pl.col('_wavg_anchor_adj_size')
+            ).alias('wavg_anchor_adj'),
         ]
     ).drop(
         [
@@ -1236,6 +1201,7 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
             '_wavg_start_skew_size', '_wavg_final_skew_size', '_wavg_abs_skew_delta_size', '_wavg_skew_delta_size',
             '_wavg_rebase_effect_dv01', '_wavg_rebase_effect_size',
             '_wavg_bucket_effect_dv01', '_wavg_trader_effect_dv01','_wavg_bucket_effect_size', '_wavg_trader_effect_size',
+            '_wavg_anchor_adj_dv01', '_wavg_anchor_adj_size',
         ], strict=False
     )
 
@@ -1259,6 +1225,7 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
             pl.col('rebase_effect').hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_rebase_effect_dv01'),
             pl.col('bucket_effect').hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_bucket_effect_dv01'),
             pl.col('group_effect').hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_trader_effect_dv01'),
+            pl.col('anchor_adj').hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_anchor_adj_dv01'),
 
             pl.col(_c('liq_score')).hyper.wavg(pl.col(_c('size'))).alias('_wavg_liq_score_size'),
             pl.col('skew').hyper.wavg(pl.col(_c('size'))).alias('_wavg_start_skew_size'),
@@ -1268,6 +1235,7 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
             pl.col('rebase_effect').hyper.wavg(pl.col(_c('size'))).alias('_wavg_rebase_effect_size'),
             pl.col('bucket_effect').hyper.wavg(pl.col(_c('size'))).alias('_wavg_bucket_effect_size'),
             pl.col('group_effect').hyper.wavg(pl.col(_c('size'))).alias('_wavg_trader_effect_size'),
+            pl.col('anchor_adj').hyper.wavg(pl.col(_c('size'))).alias('_wavg_anchor_adj_size'),
 
         ]
     ).with_columns(
@@ -1296,6 +1264,9 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
             pl.when(pl.col(_c('quote_type'))=="SPD").then(pl.col('_wavg_trader_effect_dv01')).otherwise(
                 pl.col('_wavg_trader_effect_size')
             ).alias('wavg_trader_effect'),
+            pl.when(pl.col(_c('quote_type'))=="SPD").then(pl.col('_wavg_anchor_adj_dv01')).otherwise(
+                pl.col('_wavg_anchor_adj_size')
+            ).alias('wavg_anchor_adj'),
         ]
     ).drop(
         [
@@ -1303,7 +1274,7 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
             '_wavg_liq_score_size', '_wavg_start_skew_size', '_wavg_final_skew_size', '_wavg_skew_delta_size',
             '_wavg_rebase_effect_dv01', '_wavg_rebase_effect_size',
             '_wavg_bucket_effect_dv01', '_wavg_trader_effect_dv01', '_wavg_bucket_effect_size',
-            '_wavg_trader_effect_size',
+            '_wavg_trader_effect_size', '_wavg_anchor_adj_dv01', '_wavg_anchor_adj_size',
         ], strict=False
     )
 
@@ -1409,6 +1380,7 @@ def _build_fallback_result(sub_df: pl.LazyFrame, cfg: OptimizerConfig) -> pl.Dat
         pl.Series("rebase_effect", np.round(rebase, 4)),
         pl.Series("bucket_effect", np.zeros(N)),
         pl.Series("group_effect", np.zeros(N)),
+        pl.Series("anchor_adj", np.zeros(N)),
         pl.Series("risk_pct", np.zeros(N)),
         pl.Series("final_proceeds", np.round(proceeds, 0)),
         pl.Series("proceeds_delta", np.zeros(N)),
@@ -1554,7 +1526,7 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
             ])
             _anch_final_proceeds = _anch_df['final_proceeds'].to_numpy().astype(float).copy()
 
-            _apply_anchor_wavg_skew(
+            _anch_anchor_adj = _apply_anchor_wavg_skew(
                 _anch_final_charge, _anch_final_proceeds, _anch_start_charge,
                 _anch_signs, _anch_kappa, _anch_sides, _anch_qts,
                 _anch_locked, _anch_is_px, _anch_bps_to_skew,
@@ -1576,7 +1548,8 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
             _anch_implied_spd = np.where(~_anch_is_px, _anch_ref_mid_spd + _anch_final_charge, np.nan)
             _anch_quote_spd = _anch_df[_c('quote_spd')].to_numpy().astype(float)
 
-            # Recompute decomposition (bucket_effect, group_effect)
+            # Recompute decomposition using solver-only delta (excluding anchor)
+            _anch_solver_delta = _anch_skew_delta - _anch_anchor_adj
             _anch_bucket_effect = np.zeros(_anch_N)
             _anch_inner_col = _anch_df[_c('trader')].to_list()
             _anch_tbk_keys = set()
@@ -1587,9 +1560,9 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
                 _anch_bond_tbk.append(tbk)
             for tbk in _anch_tbk_keys:
                 tbk_mask = np.array([_anch_bond_tbk[i] == tbk for i in range(_anch_N)])
-                tbk_delta = _anch_skew_delta[tbk_mask]
+                tbk_delta = _anch_solver_delta[tbk_mask]
                 _anch_bucket_effect[tbk_mask] = np.mean(tbk_delta) if tbk_mask.any() else 0.0
-            _anch_group_effect = _anch_skew_delta - _anch_bucket_effect
+            _anch_group_effect = _anch_solver_delta - _anch_bucket_effect
             # Zero out locked bonds
             for i in range(_anch_N):
                 if _anch_locked[i]:
@@ -1602,6 +1575,7 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
                 pl.Series("skew_delta", np.round(_anch_skew_delta, 4)),
                 pl.Series("bucket_effect", np.round(_anch_bucket_effect, 4)),
                 pl.Series("group_effect", np.round(_anch_group_effect, 4)),
+                pl.Series("anchor_adj", np.round(_anch_anchor_adj, 4)),
                 pl.Series("final_proceeds", np.round(_anch_final_proceeds, 0)),
                 pl.Series("proceeds_delta", np.round(_anch_proceeds_delta, 0)),
                 pl.Series("implied_px", np.round(_anch_implied_px, 6)),
@@ -1625,6 +1599,7 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
             pl.col('rebase_effect').hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_rebase_effect_dv01'),
             pl.col('bucket_effect').hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_bucket_effect_dv01'),
             pl.col('group_effect').hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_trader_effect_dv01'),
+            pl.col('anchor_adj').hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_anchor_adj_dv01'),
 
             pl.col('skew').hyper.wavg(pl.col(_c('size'))).alias('_wavg_start_skew_size'),
             pl.col('final_skew').hyper.wavg(pl.col(_c('size'))).alias('_wavg_final_skew_size'),
@@ -1633,6 +1608,7 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
             pl.col('rebase_effect').hyper.wavg(pl.col(_c('size'))).alias('_wavg_rebase_effect_size'),
             pl.col('bucket_effect').hyper.wavg(pl.col(_c('size'))).alias('_wavg_bucket_effect_size'),
             pl.col('group_effect').hyper.wavg(pl.col(_c('size'))).alias('_wavg_trader_effect_size'),
+            pl.col('anchor_adj').hyper.wavg(pl.col(_c('size'))).alias('_wavg_anchor_adj_size'),
         ]
     ).with_columns(
         [
@@ -1650,6 +1626,8 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
                 pl.col('_wavg_bucket_effect_size')).alias('wavg_bucket_effect'),
             pl.when(pl.col(_c('quote_type'))=="SPD").then(pl.col('_wavg_trader_effect_dv01')).otherwise(
                 pl.col('_wavg_trader_effect_size')).alias('wavg_trader_effect'),
+            pl.when(pl.col(_c('quote_type'))=="SPD").then(pl.col('_wavg_anchor_adj_dv01')).otherwise(
+                pl.col('_wavg_anchor_adj_size')).alias('wavg_anchor_adj'),
         ]
     ).drop(
         [
@@ -1658,6 +1636,7 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
             '_wavg_bucket_effect_dv01', '_wavg_trader_effect_dv01',
             '_wavg_start_skew_size', '_wavg_final_skew_size', '_wavg_abs_skew_delta_size', '_wavg_skew_delta_size',
             '_wavg_bucket_effect_size', '_wavg_trader_effect_size',
+            '_wavg_anchor_adj_dv01', '_wavg_anchor_adj_size',
         ], strict=False
     )
 
@@ -1682,6 +1661,7 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
             pl.col('rebase_effect').hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_rebase_effect_dv01'),
             pl.col('bucket_effect').hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_bucket_effect_dv01'),
             pl.col('group_effect').hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_trader_effect_dv01'),
+            pl.col('anchor_adj').hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_anchor_adj_dv01'),
 
             pl.col(_c('liq_score')).hyper.wavg(pl.col(_c('dv01'))).alias('_wavg_liq_score_dv01'),
             pl.col(_c('liq_score')).hyper.wavg(pl.col(_c('size'))).alias('_wavg_liq_score_size'),
@@ -1693,6 +1673,7 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
             pl.col('rebase_effect').hyper.wavg(pl.col(_c('size'))).alias('_wavg_rebase_effect_size'),
             pl.col('bucket_effect').hyper.wavg(pl.col(_c('size'))).alias('_wavg_bucket_effect_size'),
             pl.col('group_effect').hyper.wavg(pl.col(_c('size'))).alias('_wavg_trader_effect_size'),
+            pl.col('anchor_adj').hyper.wavg(pl.col(_c('size'))).alias('_wavg_anchor_adj_size'),
         ]
     ).with_columns(
         [
@@ -1712,6 +1693,8 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
                 pl.col('_wavg_bucket_effect_size')).alias('wavg_bucket_effect'),
             pl.when(pl.col(_c('quote_type'))=="SPD").then(pl.col('_wavg_trader_effect_dv01')).otherwise(
                 pl.col('_wavg_trader_effect_size')).alias('wavg_trader_effect'),
+            pl.when(pl.col(_c('quote_type'))=="SPD").then(pl.col('_wavg_anchor_adj_dv01')).otherwise(
+                pl.col('_wavg_anchor_adj_size')).alias('wavg_anchor_adj'),
         ]
     ).drop(
         [
@@ -1721,6 +1704,7 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
             '_wavg_bucket_effect_dv01', '_wavg_trader_effect_dv01',
             '_wavg_start_skew_size', '_wavg_final_skew_size', '_wavg_abs_skew_delta_size', '_wavg_skew_delta_size',
             '_wavg_bucket_effect_size', '_wavg_trader_effect_size',
+            '_wavg_anchor_adj_dv01', '_wavg_anchor_adj_size',
         ], strict=False
     )
 
