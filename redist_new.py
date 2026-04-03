@@ -643,7 +643,7 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
     qts = df.hyper.to_list(_c('quote_type'))
     inner_vals = df.hyper.to_list(inner_col)
     locked = df.select(pl.col('isLocked').cast(pl.Boolean, strict=False)).collect().to_series().to_numpy()
-    skew = df.select(pl.col('skew').cast(pl.Float64, strict=False)).collect().to_series().to_numpy()
+    skew = df.select(pl.col('skew').cast(pl.Float64, strict=False)).collect().to_series().to_numpy().copy()
     kappa = df.select(pl.col('kappa').cast(pl.Float64, strict=False)).collect().to_series().to_numpy()
     signs = df.select(pl.col('quoteSign').cast(pl.Int8, strict=False)).collect().to_series().to_numpy()
 
@@ -688,7 +688,7 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
     n_ul = len(ul_idx)
     u_sides = df.hyper.ul(_c('side'))
 
-    proceeds = df.select('skewProceeds').collect().to_series().to_numpy()
+    proceeds = df.select('skewProceeds').collect().to_series().to_numpy().copy()
     is_px = np.array([q == "PX" for q in qts])
     starting_charge_bps = np.where(is_px, skew * 100.0, skew)
     blended_raw = df.select('blendedCharge').cast(pl.Float64, strict=False).collect().to_series().to_numpy()
