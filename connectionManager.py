@@ -2681,6 +2681,7 @@ class ConnectionManager:
                 # Behavioral
                 allow_through_mid=bool(options.get('allow_through_mid', solver_defaults.get('allow_through_mid', 1))),
                 isolate_traders=isolate_traders,
+                anchor_wavg_skew=bool(options.get('anchor_wavg_skew', False)),
                 skew_asymmetry=options.get('skew_asymmetry', solver_defaults.get('skew_asymmetry', 0)),
 
                 # Solver

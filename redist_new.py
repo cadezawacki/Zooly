@@ -262,6 +262,13 @@ class OptimizerConfig:
     redistribution). Useful for debugging individual trader behavior.
     Default: False"""
 
+    anchor_wavg_skew: bool = False
+    """If True, applies a post-solver parallel shift to all unlocked bonds
+    so that the weighted-average skew per (side, quoteType) bucket matches
+    the original starting wavg skew. The solver runs normally; this is a
+    correction pass that preserves the solver's relative bond ordering.
+    Default: False"""
+
     auto_relax: bool = True
     """If True, automatically widens trader-band buffers (2x, 4x) on
     infeasibility before giving up. Prevents hard failures on tight configs.
@@ -390,6 +397,76 @@ def _parse_group_key(key: str, group_cols: list[str]) -> dict[str, str]:
     for i, col in enumerate(group_cols):
         result[col] = parts[i] if i < len(parts) else 'MISSING'
     return result
+
+
+def _apply_anchor_wavg_skew(
+    final_charge_bps: np.ndarray,
+    final_proceeds_arr: np.ndarray,
+    starting_charge_bps: np.ndarray,
+    signs: np.ndarray,
+    kappa: np.ndarray,
+    sides: list,
+    qts: list,
+    locked: np.ndarray,
+    is_px: np.ndarray,
+    bps_to_skew: np.ndarray,
+    debug: bool = False,
+):
+    """Post-solver correction: parallel-shift unlocked bonds so that the
+    weighted-average skew per (side, quoteType) bucket matches the original
+    starting wavg skew.
+
+    Weight = dv01 (=kappa) for SPD, size/10000 (=kappa) for PX — kappa
+    already encodes the correct weighting convention.
+
+    Returns modified (final_charge_bps, final_proceeds_arr) in-place.
+    """
+    N = len(final_charge_bps)
+    bucket_keys = set()
+    for i in range(N):
+        bucket_keys.add((sides[i], qts[i]))
+
+    for bk in sorted(bucket_keys):
+        s_side, s_qt = bk
+        # Masks for this bucket
+        bk_mask = np.array([sides[i] == s_side and qts[i] == s_qt for i in range(N)])
+        bk_unlocked = bk_mask & ~locked
+        bk_kappa = kappa[bk_mask]
+        ul_kappa = kappa[bk_unlocked]
+
+        total_weight = float(np.sum(bk_kappa))
+        unlocked_weight = float(np.sum(ul_kappa))
+
+        if total_weight < 1e-12 or unlocked_weight < 1e-12:
+            continue
+
+        # Starting wavg skew for this bucket (all bonds)
+        start_skew = starting_charge_bps[bk_mask] * bps_to_skew[bk_mask]
+        start_wavg = float(np.sum(start_skew * bk_kappa) / total_weight)
+
+        # Post-solver wavg skew for this bucket (all bonds)
+        post_skew = final_charge_bps[bk_mask] * bps_to_skew[bk_mask]
+        post_wavg = float(np.sum(post_skew * bk_kappa) / total_weight)
+
+        drift = post_wavg - start_wavg
+        if abs(drift) < 1e-8:
+            continue
+
+        # Shift needed on each unlocked bond (in skew units)
+        shift_skew = -drift * total_weight / unlocked_weight
+        # Convert to charge bps: for PX, bps = skew * 100; for SPD, bps = skew
+        shift_bps = shift_skew / bps_to_skew[bk_unlocked][0] if len(bps_to_skew[bk_unlocked]) else shift_skew
+
+        # Apply
+        ul_indices = np.where(bk_unlocked)[0]
+        for idx in ul_indices:
+            final_charge_bps[idx] += shift_bps
+            final_proceeds_arr[idx] = signs[idx] * final_charge_bps[idx] * kappa[idx]
+
+        if debug:
+            new_skew = final_charge_bps[bk_mask] * bps_to_skew[bk_mask]
+            new_wavg = float(np.sum(new_skew * bk_kappa) / total_weight)
+            print(f"[AnchorWAVG] {s_side} {s_qt}: start={start_wavg:.4f} → solver={post_wavg:.4f} → anchored={new_wavg:.4f}  (shift={shift_skew:.4f})")
 
 
 def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
@@ -923,6 +1000,17 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
             final_charge_bps[i] = optimal[j]
             final_proceeds_arr[i] = signs[i] * optimal[j] * kappa[i]
 
+        # ── Anchor WAVG skew correction (post-solver parallel shift) ─────
+        if cfg.anchor_wavg_skew:
+            _apply_anchor_wavg_skew(
+                final_charge_bps, final_proceeds_arr, starting_charge_bps,
+                signs, kappa, sides, qts, locked, is_px, bps_to_skew,
+                debug=cfg.debug,
+            )
+            # Re-read optimal for diagnostics after anchoring
+            for j, i in enumerate(ul_idx):
+                optimal[j] = final_charge_bps[i]
+
         # ── Build diagnostics dict ───────────────────────────────────────
         _deltas = optimal - start_ul
         _abs_deltas = np.abs(_deltas)
@@ -1437,6 +1525,58 @@ def _solve_isolated(df: pl.DataFrame | pl.LazyFrame, cfg: OptimizerConfig):
             df_result = df_result.lazy()
     except Exception as e:
         if cfg.debug: log.warning(f"Isolated risk_pct recompute failed: {e}")
+
+    # ── Anchor WAVG skew correction for isolated mode ─────────────────
+    if cfg.anchor_wavg_skew:
+        try:
+            _anch_df = df_result.collect() if hasattr(df_result, 'collect') else df_result
+            _anch_sides = _anch_df[_c('side')].to_list()
+            _anch_qts = _anch_df[_c('quote_type')].to_list()
+            _anch_final_charge = _anch_df['final_charge_bps'].to_numpy().astype(float).copy()
+            _anch_start_charge = np.where(
+                np.array([q == "PX" for q in _anch_qts]),
+                _anch_df['skew'].to_numpy().astype(float) * 100.0,
+                _anch_df['skew'].to_numpy().astype(float),
+            )
+            _anch_kappa = _anch_df['kappa'].to_numpy().astype(float)
+            _anch_is_px = np.array([q == "PX" for q in _anch_qts])
+            _anch_bps_to_skew = np.where(_anch_is_px, 1.0 / 100.0, 1.0)
+            _anch_locked = np.array([
+                abs(float(sd)) < 1e-8
+                for sd in _anch_df['skew_delta'].to_numpy()
+            ])  # In isolated mode, "locked" bonds have zero skew_delta
+            _anch_signs = np.array([
+                (1 if _anch_qts[i] == "SPD" and _anch_sides[i] == "BUY"
+                 else -1 if _anch_qts[i] == "SPD" and _anch_sides[i] == "SELL"
+                 else -1 if _anch_qts[i] == "PX" and _anch_sides[i] == "BUY"
+                 else 1)
+                for i in range(len(_anch_sides))
+            ])
+            _anch_final_proceeds = _anch_df['final_proceeds'].to_numpy().astype(float).copy()
+
+            _apply_anchor_wavg_skew(
+                _anch_final_charge, _anch_final_proceeds, _anch_start_charge,
+                _anch_signs, _anch_kappa, _anch_sides, _anch_qts,
+                _anch_locked, _anch_is_px, _anch_bps_to_skew,
+                debug=cfg.debug,
+            )
+
+            _anch_implied_skew = _anch_final_charge * _anch_bps_to_skew
+            _anch_start_skew = _anch_start_charge * _anch_bps_to_skew
+            _anch_skew_delta = (_anch_final_charge - _anch_start_charge) * _anch_bps_to_skew
+            _anch_proceeds_delta = _anch_final_proceeds - _anch_df['starting_proceeds'].to_numpy().astype(float)
+
+            df_result = _anch_df.with_columns([
+                pl.Series("final_charge_bps", np.round(_anch_final_charge, 4)),
+                pl.Series("final_skew", np.round(_anch_implied_skew, 4)),
+                pl.Series("skew_delta", np.round(_anch_skew_delta, 4)),
+                pl.Series("final_proceeds", np.round(_anch_final_proceeds, 0)),
+                pl.Series("proceeds_delta", np.round(_anch_proceeds_delta, 0)),
+            ]).lazy()
+        except Exception as e:
+            if cfg.debug: log.warning(f"Isolated anchor WAVG skew failed: {e}")
+            if not isinstance(df_result, pl.LazyFrame):
+                df_result = df_result.lazy()
 
     summary_overall = df_result.group_by([_c('side'), _c('quote_type')]).agg(
         [

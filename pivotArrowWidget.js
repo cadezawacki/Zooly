@@ -1295,6 +1295,7 @@ export class PivotWidget extends BaseWidget {
             const opts = {
                 linear: false,
                 isolate_traders: cached.isolate_traders ?? false,
+                anchor_wavg_skew: cached.anchor_wavg_skew ?? false,
                 max_individual_spread_skew_delta: cached.max_individual_spread_skew_delta ?? null,
                 max_individual_px_skew_delta: cached.max_individual_px_skew_delta ?? null,
                 match_pivot_groups: cached.match_pivot_groups ?? false,
@@ -1512,6 +1513,13 @@ export class PivotWidget extends BaseWidget {
                         </label>
                         <span class="scfg-tag">Each trader optimized independently</span>
                     </div>
+                    <div class="scfg-toggle-row">
+                        <label class="scfg-toggle-row-wrapper">
+                            <input type="checkbox" id="scfg-anchor-wavg" ${opts.anchor_wavg_skew ? 'checked' : ''}/>
+                            <span for="scfg-anchor-wavg">Anchor WAVG Skew</span>
+                        </label>
+                        <span class="scfg-tag">Preserve starting weighted-avg skew</span>
+                    </div>
                 </div>
         
                 <div class="scfg-divider"></div>
@@ -1636,6 +1644,14 @@ export class PivotWidget extends BaseWidget {
                 if (isolateEl) {
                     isolateEl.addEventListener('change', () => {
                         opts.isolate_traders = isolateEl.checked;
+                    });
+                }
+
+                // Anchor WAVG Skew toggle
+                const anchorWavgEl = document.getElementById('scfg-anchor-wavg');
+                if (anchorWavgEl) {
+                    anchorWavgEl.addEventListener('change', () => {
+                        opts.anchor_wavg_skew = anchorWavgEl.checked;
                     });
                 }
 
