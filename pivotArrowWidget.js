@@ -689,7 +689,7 @@ export class PivotWidget extends BaseWidget {
 
         // ── Diff view: compare vs previous run ────────────────────────────
         const _DIFF_KEY = 'pt:redistPrev';
-        const _portfolioKey = roomContext?.room || 'default';
+        const _portfolioKey = roomContext?.room || roomContext?.key || 'default';
         const _groupSig = JSON.stringify(resGroupCols || ['desigName']);
         let _prevRun = null;
         let _diffAvailable = false;
@@ -724,14 +724,16 @@ export class PivotWidget extends BaseWidget {
                 groupSig: _groupSig,
                 detail: (detail || []).map(b => ({
                     tnum: b.tnum, skew: b.skew, bucket_effect: b.bucket_effect,
-                    group_effect: b.group_effect, skew_delta: b.skew_delta,
+                    group_effect: b.group_effect, anchor_adj: b.anchor_adj,
+                    final_skew: b.final_skew, skew_delta: b.skew_delta,
                     proceeds_delta: b.proceeds_delta,
                 })),
                 trader: (trader || []).map(t => ({
                     _groupKey: _buildGroupKey(t),
                     desigName: t.desigName, side: t.side, quoteType: t.quoteType,
                     wavg_start_skew: t.wavg_start_skew, wavg_bucket_effect: t.wavg_bucket_effect,
-                    wavg_trader_effect: t.wavg_trader_effect, wavg_skew_delta: t.wavg_skew_delta,
+                    wavg_trader_effect: t.wavg_trader_effect, wavg_anchor_adj: t.wavg_anchor_adj,
+                    wavg_final_skew: t.wavg_final_skew, wavg_skew_delta: t.wavg_skew_delta,
                     proceeds_delta: t.proceeds_delta,
                 })),
                 summary: (summary || []).map(s => ({
@@ -873,10 +875,22 @@ export class PivotWidget extends BaseWidget {
             return `<div class="rdm-diff-ann" style="font-size:9px;color:${color};line-height:1;display:none;" title="change from previous run">${arrow}${display}</div>`;
         };
         // Keys that get diff annotations
-        const _diffKeys = new Set(['wavg_start_skew','wavg_bucket_effect','wavg_trader_effect','wavg_skew_delta','proceeds_delta',
-                                   'skew','bucket_effect','group_effect','skew_delta']);
+        const _diffKeys = new Set([
+            'wavg_start_skew','wavg_bucket_effect','wavg_trader_effect','wavg_anchor_adj','wavg_final_skew','wavg_skew_delta','proceeds_delta',
+            'skew','bucket_effect','group_effect','anchor_adj','final_skew','skew_delta',
+        ]);
 
         const CHEVRON_SVG = `<svg class="rdm-chevron" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6 3L11 8L6 13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+        // Shared constraint badge formatter
+        const _boundFmt = v => {
+            if (!v) return '';
+            const labels = {side: 'WAVG', trader: 'ALLOC', mid: 'MID', cap: 'CAP', locked: 'LOCK'};
+            const colors = {side: '#f59e0b', trader: '#8b5cf6', mid: '#3b82f6', cap: '#ef4444', locked: '#6b7280'};
+            const label = labels[v] || v;
+            const color = colors[v] || '#9ca3af';
+            return `<span style="background:${color}22;color:${color};padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;display:inline-block;">${label}</span>`;
+        };
 
         const summaryDisplayCols = [
             {key: '_expand', label: '', width: 'var(--expand-width, 10px)'},
@@ -895,6 +909,7 @@ export class PivotWidget extends BaseWidget {
             {key: 'wavg_final_skew', label: 'Final', tip: 'Skew', fmt: v => fmtNum(v, 2, true), highlight: true},
             {key: 'wavg_skew_delta', label: 'Wavg Δ', tip: 'Delta', fmt: v => fmtNum(v, 2, true), isDelta: true},
             {key: 'proceeds_delta', label: 'PNL Δ', tip: 'Delta', fmt: v => fmtK(v, true, "$"), isPnl: true},
+            {key: '_bound_summary', label: 'Bound', tip: '', fmt: null, isBound: true},
         ];
 
         // Header row
@@ -933,20 +948,16 @@ export class PivotWidget extends BaseWidget {
             {key: 'final_skew', label: 'Final', tip: 'Skew', fmt: v => fmtNum(v, 2, true), highlight: true},
             {key: 'skew_delta', label: 'Delta Δ', tip: 'Skew', fmt: v => fmtNum(v, 2, true), isDelta: true},
             {key: 'proceeds_delta', label: 'PNL Δ', tip: 'Delta', fmt: v => fmtK(v, true, "$"), isPnl: true},
-            {key: 'binding_constraint', label: 'Bound', tip: 'Constraint', fmt: v => {
-                if (!v) return '';
-                const labels = {side: 'WAVG', trader: 'ALLOC', mid: 'MID', cap: 'CAP', locked: 'LOCK'};
-                const colors = {side: '#f59e0b', trader: '#8b5cf6', mid: '#3b82f6', cap: '#ef4444', locked: '#6b7280'};
-                const label = labels[v] || v;
-                const color = colors[v] || '#9ca3af';
-                return `<span style="background:${color}22;color:${color};padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">${label}</span>`;
-            }},
+            {key: 'binding_constraint', label: 'Bound', tip: 'Constraint', fmt: _boundFmt, isBound: true},
         ];
 
         const buildBondRows = (bondList, qt, side) => {
             return bondList.map(bond => {
                 const prev = _prevDetailIdx.get(bond.tnum);
                 return '<tr>' + bondDetailCols.map(c => {
+                    if (c.isBound) {
+                        return `<td style="text-align:center;">${c.fmt(bond[c.key])}</td>`;
+                    }
                     const raw = bond[c.key];
                     const display = c.fmt ? c.fmt(raw) : esc(raw);
                     let style = '';
@@ -1003,11 +1014,28 @@ export class PivotWidget extends BaseWidget {
                 const detailKey = `${_buildGroupKey(row)}|${side}|${qt}`;
                 const bonds = detailIndex.get(detailKey) || [];
 
+                // Compute dominant binding constraint for this trader-bucket
+                const _boundCounts = {};
+                for (const b of bonds) {
+                    const bc = b.binding_constraint;
+                    if (bc) _boundCounts[bc] = (_boundCounts[bc] || 0) + 1;
+                }
+                // Pick the most frequent non-locked constraint, or locked if all locked
+                let _dominantBound = '';
+                let _maxCount = 0;
+                for (const [k, cnt] of Object.entries(_boundCounts)) {
+                    if (cnt > _maxCount) { _maxCount = cnt; _dominantBound = k; }
+                }
+                row['_bound_summary'] = _dominantBound;
+
                 // Summary row
                 const _prevTrader = _prevTraderIdx.get(`${_buildGroupKey(row)}|${side}|${qt}`);
                 const cells = summaryDisplayCols.map(c => {
                     if (c.key === '_expand') {
                         return `<td style="width:24px;text-align:center;padding:4px 2px;">${CHEVRON_SVG}</td>`;
+                    }
+                    if (c.isBound) {
+                        return `<td style="text-align:center;" class="td-${qt.toString().toLowerCase()} td-${side.toString().toLowerCase()}">${_boundFmt(row[c.key])}</td>`;
                     }
                     const raw = row[c.key];
                     const display = c.fmt ? c.fmt(raw) : esc(raw);
@@ -1174,11 +1202,11 @@ export class PivotWidget extends BaseWidget {
                     <span title="Curve + Residual + Adj = total change"><b>Delta</b> = Curve + Residual + Adj</span>
             </div>
             <div class="rdm-table-legend" style="margin-top:2px;">
-                    <span title="Bond hit the WAVG skew band — total proceeds per side can only shift ±(1−floor%)"><span style="background:#f59e0b22;color:#f59e0b;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">WAVG</span> side-level skew band</span>
-                    <span title="Bond hit the trader allocation guardrail — trader's total proceeds can't deviate beyond buffer from target"><span style="background:#8b5cf622;color:#8b5cf6;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">ALLOC</span> trader allocation band</span>
-                    <span title="Bond can't cross mid (charge sign constrained)"><span style="background:#3b82f622;color:#3b82f6;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">MID</span> through-mid limit</span>
-                    <span title="Bond hit the per-bond skew delta cap"><span style="background:#ef444422;color:#ef4444;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">CAP</span> per-bond skew cap</span>
-                    <span title="Bond is locked and cannot be moved"><span style="background:#6b728022;color:#6b7280;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">LOCK</span> locked</span>
+                    <span title="Overall skew for this side (BUY/SELL) hit the floor — the solver can't move the average skew any further without breaching the side constraint"><span style="background:#f59e0b22;color:#f59e0b;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">WAVG</span> avg skew at limit</span>
+                    <span title="This trader's total proceeds hit their allocation guardrail — can't take more or give more without breaching the trader band"><span style="background:#8b5cf622;color:#8b5cf6;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">ALLOC</span> trader band at limit</span>
+                    <span title="Bond would need to cross through mid to improve but crossing mids is disabled"><span style="background:#3b82f622;color:#3b82f6;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">MID</span> blocked by mid</span>
+                    <span title="Bond hit the max skew change you set in config — it wants to move further but can't"><span style="background:#ef444422;color:#ef4444;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">CAP</span> hit skew cap</span>
+                    <span title="Bond is locked and excluded from optimization"><span style="background:#6b728022;color:#6b7280;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;">LOCK</span> locked</span>
             </div>
         </div>
     `;
