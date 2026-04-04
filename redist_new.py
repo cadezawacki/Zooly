@@ -1056,10 +1056,6 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
         except Exception:
             pass  # attribution is best-effort, don't break the solve
 
-        # Mark locked bonds
-        for i in lk_idx:
-            _bond_constraint[i] = 'locked'
-
         # ── Build diagnostics dict ───────────────────────────────────────
         _deltas = optimal - start_ul
         _abs_deltas = np.abs(_deltas)
@@ -1106,6 +1102,10 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
     else:
         log.warning("Using starting values as fallback (no valid solution).")
         diagnostics = {"status": "FAILED", "bonds_total": N, "bonds_unlocked": n_ul}
+
+    # Mark locked bonds (outside solver success block — always applies)
+    for i in lk_idx:
+        _bond_constraint[i] = 'locked'
 
     # ── Decomposition (post-hoc) ──────────────────────────────────────
     #   skew_delta[i] = final_charge - starting_charge (in skew units, includes anchor)
