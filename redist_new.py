@@ -800,12 +800,6 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
     l = cfg.lambda_param or 0.0
     g = cfg.gamma or 0.0
 
-    # Guard: if all penalty strengths are zero, the objective degenerates to
-    # pure PnL maximization — the solver bangs every bond to the side floor.
-    # Inject a large anchoring penalty so bonds stay at their starting values.
-    if l == 0 and g == 0 and cfg.trader_pull == 0:
-        l = 1e6
-
     delta_from_start = charge - start_ul
     delta_from_ideal = charge - ideal_charge
 
@@ -830,8 +824,19 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
 
     is_ok_final = False
     prob = None
+    _constraint_meta: list[tuple] = []
+
+    # Guard: if all penalty strengths are zero, the objective degenerates to
+    # pure PnL maximization — the solver bangs every bond to the side floor.
+    # Skip the solver entirely and force charge = starting values.
+    if l == 0 and g == 0 and cfg.trader_pull == 0:
+        log.warning("All penalty strengths are zero — skipping solver, returning starting values.")
+        charge.value = start_ul.copy()
+        is_ok_final = True
 
     for attempt, tier in enumerate(tiers):
+        if is_ok_final:
+            break
         log.notify(f'Running solver tier {attempt}: {tier["desc"]}')
         constraints: list[cp.Constraint] = []
         # Constraint metadata for attribution: list of (constraint, type, scope)
