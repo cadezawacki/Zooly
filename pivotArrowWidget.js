@@ -717,7 +717,18 @@ export class PivotWidget extends BaseWidget {
                 _prevSummaryIdx.set(`${s.side}|${s.quoteType}`, s);
             }
         }
-        // Save current run for next comparison
+
+        // Determine the grouping key column(s) — defaults to desigName when not using pivot groups
+        const _groupCols = (resGroupCols && resGroupCols.length > 0) ? resGroupCols : ['desigName'];
+        const _groupLabel = _groupCols.length === 1
+            ? (_groupCols[0] === 'desigName' ? 'Trader' : 'Group')
+            : 'Group';
+        // Helper to build composite key from a row using the group columns
+        const _buildGroupKey = (row) => _groupCols.map(c => row[c] ?? '').join('|');
+        // Helper to build display value from a row
+        const _buildGroupDisplay = (row) => _groupCols.map(c => row[c] ?? '').join(' / ');
+
+        // Save current run for next comparison (must be after _buildGroupKey is defined)
         try {
             sessionStorage.setItem(_DIFF_KEY, JSON.stringify({
                 portfolioKey: _portfolioKey,
@@ -744,15 +755,6 @@ export class PivotWidget extends BaseWidget {
             }));
         } catch {}
 
-        // Determine the grouping key column(s) — defaults to desigName when not using pivot groups
-        const _groupCols = (resGroupCols && resGroupCols.length > 0) ? resGroupCols : ['desigName'];
-        const _groupLabel = _groupCols.length === 1
-            ? (_groupCols[0] === 'desigName' ? 'Trader' : 'Group')
-            : 'Group';
-        // Helper to build composite key from a row using the group columns
-        const _buildGroupKey = (row) => _groupCols.map(c => row[c] ?? '').join('|');
-        // Helper to build display value from a row
-        const _buildGroupDisplay = (row) => _groupCols.map(c => row[c] ?? '').join(' / ');
         if (!updates || updates.length === 0) {
             toast.info('Redistribute', 'No eligible rows for redistribution.');
             cleanup();
