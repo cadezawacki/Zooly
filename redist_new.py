@@ -800,6 +800,12 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
     l = cfg.lambda_param or 0.0
     g = cfg.gamma or 0.0
 
+    # Guard: if all penalty strengths are zero, the objective degenerates to
+    # pure PnL maximization — the solver bangs every bond to the side floor.
+    # Inject a large anchoring penalty so bonds stay at their starting values.
+    if l == 0 and g == 0 and cfg.trader_pull == 0:
+        l = 1e6
+
     delta_from_start = charge - start_ul
     delta_from_ideal = charge - ideal_charge
 
