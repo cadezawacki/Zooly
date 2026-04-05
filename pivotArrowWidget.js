@@ -1142,16 +1142,28 @@ export class PivotWidget extends BaseWidget {
                     <span class="rdm-diag-item" title="Largest move on any single bond"><b>Max Δ</b> ${fmtNum(dp.max_delta, 2)}bps</span>
                     <span class="rdm-diag-item" title="How many bonds moved more than 0.1 bps"><b>Moved</b> ${dp.bonds_moved_1 ?? '?'}/${dp.bonds_unlocked ?? '?'}</span>
                 </div>`;
-            } else if (!_isIsolated && diag && diag.status) {
-                const dp = diag;
-                diagHtml = `<div class="rdm-diag-row">
-                    <span class="rdm-diag-item" title="Change in PnL from optimization"><b>PnL Δ</b> ${fmtK(dp.pnl_delta, true, '$')}</span>
-                    <span class="rdm-diag-item" title="PnL sacrificed to keep bonds near current levels (higher anchoring = higher cost)"><b>Stability cost</b> ${fmtK(dp.smoothness_penalty, false, '-$')}</span>
-                    <span class="rdm-diag-item" title="PnL sacrificed to follow the charge curve shape (higher curve shaping = higher cost)"><b>Shaping cost</b> ${fmtK(dp.curve_penalty, false, '-$')}</span>
-                    <span class="rdm-diag-item" title="Average skew change per bond"><b>Avg Δ</b> ${fmtNum(dp.avg_delta, 2)}bps</span>
-                    <span class="rdm-diag-item" title="Largest move on any single bond"><b>Max Δ</b> ${fmtNum(dp.max_delta, 2)}bps</span>
-                    <span class="rdm-diag-item" title="How many bonds moved more than 0.1 bps"><b>Moved</b> ${dp.bonds_moved_1 ?? '?'}/${dp.bonds_unlocked ?? '?'}</span>
-                </div>`;
+            } else if (!_isIsolated) {
+                // Compute per-bucket stats from detail bonds in this table
+                const bucketBonds = [];
+                for (const r of rows) {
+                    const key = `${_buildGroupKey(r)}|${side}|${qt}`;
+                    const bonds = detailIndex.get(key) || [];
+                    bucketBonds.push(...bonds);
+                }
+                if (bucketBonds.length > 0) {
+                    const deltas = bucketBonds.map(b => Math.abs(b.skew_delta ?? 0));
+                    const pnlDelta = bucketBonds.reduce((s, b) => s + (b.proceeds_delta ?? 0), 0);
+                    const avgDelta = deltas.reduce((a, b) => a + b, 0) / deltas.length;
+                    const maxDelta = Math.max(...deltas);
+                    const moved = deltas.filter(d => d > 0.1).length;
+                    const total = bucketBonds.length;
+                    diagHtml = `<div class="rdm-diag-row">
+                        <span class="rdm-diag-item" title="Change in PnL from optimization"><b>PnL Δ</b> ${fmtK(pnlDelta, true, '$')}</span>
+                        <span class="rdm-diag-item" title="Average skew change per bond"><b>Avg Δ</b> ${fmtNum(avgDelta, 2)}bps</span>
+                        <span class="rdm-diag-item" title="Largest move on any single bond"><b>Max Δ</b> ${fmtNum(maxDelta, 2)}bps</span>
+                        <span class="rdm-diag-item" title="How many bonds moved more than 0.1 bps"><b>Moved</b> ${moved}/${total}</span>
+                    </div>`;
+                }
             }
 
             // Apply Slice: include trader filter for isolated mode
