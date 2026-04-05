@@ -524,6 +524,26 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
         ]
     )
 
+    # ── Apply "Run From X" override BEFORE trader aggregation ─────────
+    # Must happen before trader_agg so that expected_proceeds (trader targets)
+    # reflect the overridden starting values, not the original live skews.
+    if cfg.starting_skew_override:
+        print(f"[RunFromX] Override received: {cfg.starting_skew_override}")
+        _skew_expr = pl.col('skew')
+        for (s_key, q_key), oval in cfg.starting_skew_override.items():
+            _mask = (pl.col(_c('side')) == s_key) & (pl.col(_c('quote_type')) == q_key)
+            _skew_expr = pl.when(_mask).then(pl.lit(float(oval))).otherwise(_skew_expr)
+        df = df.with_columns(_skew_expr.alias('skew'))
+        # Recompute skewProceeds from overridden skew: proceeds = quoteSign × charge_bps × kappa
+        # charge_bps = skew for SPD, skew×100 for PX; kappa = dv01 for SPD, size/10000 for PX
+        # So: SPD proceeds = quoteSign × skew × dv01; PX proceeds = quoteSign × skew × size/100
+        df = df.with_columns(
+            pl.when(IS_SPREAD)
+            .then(pl.col('quoteSign').cast(pl.Float64) * pl.col('skew') * pl.col(_c('dv01')))
+            .otherwise(pl.col('quoteSign').cast(pl.Float64) * pl.col('skew') * pl.col(_c('size')) / 100.0)
+            .alias('skewProceeds')
+        )
+
     N = df.hyper.height()
     if N==0:
         return pl.DataFrame(), {"status": 'FAILED'}, pl.DataFrame(), pl.DataFrame(), removed_ids
@@ -693,25 +713,6 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
     starting_charge_bps = np.where(is_px, skew * 100.0, skew)
     blended_raw = df.select('blendedCharge').cast(pl.Float64, strict=False).collect().to_series().to_numpy()
     bps_to_skew = np.where(is_px, 1.0 / 100.0, 1.0)
-
-    # ── Apply "Run From X" override if set ────────────────────────────
-    if cfg.starting_skew_override:
-        print(f"[RunFromX] Override received: {cfg.starting_skew_override}")
-        applied = 0
-        for i in range(N):
-            bk = (sides[i], qts[i])
-            if bk in cfg.starting_skew_override:
-                override_val = float(cfg.starting_skew_override[bk])
-                starting_charge_bps[i] = override_val * 100.0 if is_px[i] else override_val
-                skew[i] = override_val  # update skew for display
-                proceeds[i] = signs[i] * starting_charge_bps[i] * kappa[i]
-                applied += 1
-        print(f"[RunFromX] Applied to {applied}/{N} bonds")
-        # Update the DataFrame so downstream aggregations use overridden skew/proceeds
-        df = df.collect().with_columns([
-            pl.Series("skew", skew),
-            pl.Series("skewProceeds", proceeds),
-        ]).lazy()
 
     start_by_side: dict[str, float] = {}
     for s in u_sides:
