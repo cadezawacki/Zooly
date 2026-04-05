@@ -902,6 +902,8 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
             # enough to cover whichever direction the optimizer needs to move.
             # When soft penalties are active (trader_pull > 0), widen further —
             # let the soft penalty do redistribution, hard bands catch extremes only.
+            # Scale by target_blend: at target_blend=0, bands lock each trader
+            # to their starting allocation (no redistribution at any level).
             if tbk_ul_mask.any():
                 reference = max(abs(target), abs(start_tbk), abs(target - start_tbk))
                 if cfg.buffer_mode == 'pct':
@@ -912,6 +914,8 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
                 if cfg.trader_pull > 0 or g > 0:
                     buf = max(buf, abs(target - start_tbk) * 1.5)
                 buf *= tier["buffer_mult"]
+                # Tighten proportionally to target_blend
+                buf *= max(cfg.target_blend, 1e-4)
                 constraints.append(trader_total <= target + buf)
                 _constraint_meta.append((constraints[-1], 'trader_ceil', tbk))
                 constraints.append(trader_total >= target - buf)
