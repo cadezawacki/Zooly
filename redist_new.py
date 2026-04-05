@@ -844,6 +844,15 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
         _constraint_meta: list[tuple] = []
 
         # ── Side band constraints ─────────────────────────────────────
+        # Scale side_floor_pct by target_blend: when target_blend=0 the user
+        # intends "don't change the portfolio level", so tighten the band to
+        # prevent wavg drift.  At target_blend=1 the full configured floor
+        # applies.  This prevents gamma/curve reshaping from shifting the
+        # overall weighted-average skew when the user hasn't asked for
+        # portfolio-level redistribution.
+        _effective_floor = cfg.side_floor_pct + (1.0 - cfg.side_floor_pct) * (1.0 - cfg.target_blend)
+        _effective_floor = min(_effective_floor, 0.99999)  # tiny headroom for numerical feasibility
+
         for s in u_sides:
             start_val = start_by_side.get(s, 0)
             if start_val == 0:
@@ -856,11 +865,11 @@ def solve(df: pl.DataFrame, cfg: OptimizerConfig | None = None, name=None):
             side_total = (cp.sum(ul_proceeds[side_mask]) if side_mask.any() else 0.0) + lk_side
 
             if start_val >= 0:
-                floor_val = cfg.side_floor_pct * start_val
-                ceil_val = start_val / cfg.side_floor_pct
+                floor_val = _effective_floor * start_val
+                ceil_val = start_val / _effective_floor
             else:
-                floor_val = start_val / cfg.side_floor_pct
-                ceil_val = cfg.side_floor_pct * start_val
+                floor_val = start_val / _effective_floor
+                ceil_val = _effective_floor * start_val
 
             constraints.append(side_total >= floor_val)
             _constraint_meta.append((constraints[-1], 'side_floor', s))
