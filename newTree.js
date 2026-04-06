@@ -1161,6 +1161,7 @@ export class TreeColumnChooser {
                         id: 'viewName',
                         label: 'View Name',
                         required: true,
+                        value: activePreset ? `${activePreset.name} (copy)` : 'My View',
                         placeholder: activePreset ? `${activePreset.name} (Modified)` : 'My View'
                     },
                     {
@@ -1357,10 +1358,13 @@ export class TreeColumnChooser {
 
 
     async _handleCreate() {
+        const defaultName = this.activePresetName
+            ? this.activePresetName + ' (copy)'
+            : 'My View';
         const result = await this.modalManager.show({
             title: 'Save New View',
             fields: [
-                { type: 'text', id: 'viewName', label: 'View Name', required: true },
+                { type: 'text', id: 'viewName', label: 'View Name', required: true, value: defaultName },
                 { type: 'textarea', id: 'description', label: 'Description (optional)', rows: 2 }
             ],
             buttons: [
@@ -4600,7 +4604,28 @@ export class TreeColumnChooser {
             }
 
             if (actionResult === 'import') {
-                const success = this.saveImport(cleanState.name, cleanState);
+                // Check if a preset with this name already exists
+                let saveName = cleanState.name;
+                if (this.presets.has(saveName)) {
+                    const renameResult = await this.modalManager.show({
+                        title: 'View Name Conflict',
+                        body: `<p>A view named "<strong>${safeImportName}</strong>" already exists. Please choose a new name.</p>`,
+                        fields: [
+                            { type: 'text', id: 'viewName', label: 'View Name', required: true, value: saveName + ' (imported)' }
+                        ],
+                        buttons: [
+                            { text: 'Cancel', value: 'cancel' },
+                            { text: 'Save', value: 'save', class: 'btn-primary', isSubmit: true }
+                        ]
+                    });
+                    if (!renameResult || renameResult === 'cancel' || renameResult === 'cancel_esc' || renameResult === 'cancel_backdrop' || !renameResult.viewName?.trim()) {
+                        this.context.page.toastManager().info('Import cancelled.', 'Info');
+                        return false;
+                    }
+                    saveName = renameResult.viewName.trim();
+                    cleanState.name = saveName;
+                }
+                const success = this.saveImport(saveName, cleanState);
             } else { // actionResult === 'view'
                 this.currentState = cleanState;
                 this.pendingStateName = cleanState.name;
