@@ -4301,9 +4301,11 @@ export class TreeColumnChooser {
                                 </div>
                                 <div style="border-top:1px solid var(--ag-border-color, #ddd);padding-top:12px;">
                                     <h3 style="font-weight:600;margin-bottom:8px;font-size:14px;">Import Config</h3>
-                                    <textarea data-role="import-text" placeholder="Paste config JSON here..." style="width:100%;height:120px;padding:8px;border:1px solid var(--ag-border-color, #ddd);border-radius:4px;font-family:monospace;font-size:12px;resize:vertical;"></textarea>
-                                    <div style="display:flex;gap:8px;margin-top:8px;align-items:center;">
-                                        <button class="btn btn-sm btn-primary" data-action="import-paste">Import from Text</button>
+                                    <div style="display:flex;gap:8px;align-items:center;">
+                                        <button class="btn btn-sm btn-primary" data-action="import-clipboard">
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:4px;"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect></svg>
+                                            Read from Clipboard
+                                        </button>
                                         <span style="color:#999;font-size:12px;">or</span>
                                         <label class="btn btn-sm btn-outline" style="cursor:pointer;">
                                             <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:4px;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
@@ -4353,18 +4355,25 @@ export class TreeColumnChooser {
                     }
                 });
 
-                // Import from pasted text
-                contentArea.querySelector('[data-action="import-paste"]').addEventListener('click', () => {
-                    const text = contentArea.querySelector('[data-role="import-text"]').value.trim();
-                    if (!text) {
-                        showStatus('Please paste a config JSON first.', 'error');
-                        return;
-                    }
+                // Import from clipboard
+                const clipboardBtn = contentArea.querySelector('[data-action="import-clipboard"]');
+                clipboardBtn.addEventListener('click', async () => {
                     try {
-                        treeCtx.handleImport(text);
-                        dialog.close('imported_paste');
+                        clipboardBtn.disabled = true;
+                        clipboardBtn.textContent = 'Reading Clipboard...';
+                        const text = await navigator.clipboard.readText();
+                        if (!text || !text.trim()) {
+                            showStatus('Clipboard is empty.', 'error');
+                            clipboardBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:4px;"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect></svg> Read from Clipboard';
+                            clipboardBtn.disabled = false;
+                            return;
+                        }
+                        treeCtx.handleImport(text.trim());
+                        dialog.close('imported_clipboard');
                     } catch (err) {
-                        showStatus('Invalid JSON: ' + err.message, 'error');
+                        showStatus('Failed to read clipboard: ' + err.message, 'error');
+                        clipboardBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:4px;"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect></svg> Read from Clipboard';
+                        clipboardBtn.disabled = false;
                     }
                 });
 
