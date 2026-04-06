@@ -4277,6 +4277,10 @@ export class TreeColumnChooser {
             metadata: metaPayload,
             ...currentState,
         };
+        // Include custom column names so they survive export/import
+        if (this.customNames && Object.keys(this.customNames).length > 0) {
+            exportPayload.customNames = { ...this.customNames };
+        }
         const exportJson = JSON.stringify(exportPayload, null, 2);
         const pageContext = this; // Capture context
         await this.modalManager.showCustom({
@@ -4539,8 +4543,8 @@ export class TreeColumnChooser {
             const stateData = typeof data === 'string' ? JSON.parse(data) : data;
 
             // Basic validation of the imported structure
-            if (!stateData?.name || !stateData.columnState || !stateData.filterModel) {
-                throw new Error('Invalid view data format. Missing essential properties.');
+            if (!stateData?.name || !stateData.columnState) {
+                throw new Error('Invalid view data format. Missing essential properties (name, columnState).');
             }
 
             // Show confirmation modal (View Only / Import)
@@ -4570,7 +4574,8 @@ export class TreeColumnChooser {
                 // Base structure from imported data
                 name: stateData.name,
                 columnState: stateData.columnState,
-                filterModel: this.config.enableFilterMemory ? stateData.filterModel : null,
+                filterModel: this.config.enableFilterMemory ? (stateData.filterModel || null) : null,
+                sortModel: this.config.enableSortMemory ? (stateData.sortModel || null) : null,
                 pinnedColumns: stateData.pinnedColumns || { left: [], right: [] }, // Ensure pinned exists
 
                 metadata: {
@@ -4587,6 +4592,12 @@ export class TreeColumnChooser {
                 isDefault: false, // Imported states are never default initially
                 isTemporary: (actionResult === 'view') // Set temporary flag for 'View Only'
             };
+
+            // Apply imported custom column names if present
+            if (stateData.customNames && typeof stateData.customNames === 'object') {
+                Object.assign(this.customNames, stateData.customNames);
+                this.saveCustomNames();
+            }
 
             if (actionResult === 'import') {
                 const success = this.saveImport(cleanState.name, cleanState);
