@@ -1061,12 +1061,40 @@ export class TreeColumnChooser {
             const presetsArray = Array.from(this.presets.values())
                                        .filter(p => !p.metaData?.isGlobal);
 
+            // Strip default/falsy values from columnState to reduce size
+            const compact = presetsArray.map(p => {
+                if (!Array.isArray(p.columnState)) return p;
+                const slimColumns = p.columnState.map(c => {
+                    const s = { colId: c.colId };
+                    if (c.hide) s.hide = true;
+                    if (c.pinned) s.pinned = c.pinned;
+                    if (c.sort) s.sort = c.sort;
+                    if (typeof c.sortIndex === 'number') s.sortIndex = c.sortIndex;
+                    if (typeof c.width === 'number' && c.width > 0) s.width = c.width;
+                    if (c.aggFunc) s.aggFunc = c.aggFunc;
+                    if (c.rowGroup) s.rowGroup = true;
+                    if (typeof c.rowGroupIndex === 'number') s.rowGroupIndex = c.rowGroupIndex;
+                    if (c.pivot) s.pivot = true;
+                    if (typeof c.pivotIndex === 'number') s.pivotIndex = c.pivotIndex;
+                    return s;
+                });
+                // Shallow copy, drop transient import metadata
+                const { metadata, isTemporary, ...rest } = p;
+                return { ...rest, columnState: slimColumns };
+            });
+
             localStorage.setItem(
                 `treeColumnChooser_presets_${this.gridName}`,
-                JSON.stringify(presetsArray)
+                JSON.stringify(compact)
             );
         } catch (e) {
             console.error("Failed to save presets to cache", e);
+            if (e?.name === 'QuotaExceededError') {
+                this.context.page.toastManager?.().error(
+                    'Storage is full. Try deleting unused views to free up space.',
+                    this.gridName.toUpperCase()
+                );
+            }
         }
     }
 
